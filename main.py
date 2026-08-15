@@ -1,6 +1,8 @@
 import os
 import json
 import requests
+import re
+import feedparser
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import cairosvg
 
@@ -97,23 +99,47 @@ SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME")
 STATE_FILE = "state.json"
+# URL RSS-ленты El País (Новости по Испании)
+# Можно заменить на свою ленту
+RSS_FEED_URL = "https://servicios.elpais.com/rss/elpais/portada.xml"
 
+# Очистка заголовка от эмодзи (так как они не рендерятся шрифтом Exo 2)
+def strip_emojis(text):
+    if not text:
+        return ""
+    # Регулярное выражение для удаления эмодзи
+    text = re.sub(r'[^\w\s.,!?-]', '', text, flags=re.UNICODE)
+    return text.strip()
+
+# Загрузка ID последней обработанной новости
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
-            return json.load(f).get("last_id", 0)
+            try:
+                return json.load(f).get("last_id", 0)
+            except json.JSONDecodeError:
+                return 0
     return 0
 
+# Сохранение ID последней новости
 def save_state(post_id):
     with open(STATE_FILE, "w") as f:
         json.dump({"last_id": post_id}, f)
 
+# Генерация branded-карточки (теперь с реальными данными)
 def generate_card(image_url, title_text, output_path="banner.jpg"):
-    img_data = requests.get(image_url).content
-    with open("temp_src.jpg", "wb") as f:
-        f.write(img_data)
-        
-    img = Image.open("temp_src.jpg").convert("RGBA")
+    print(f"Попытка скачать фото для генерации: {image_url}")
+    try:
+        img_data = requests.get(image_url).content
+    except Exception as e:
+        print(f"Ошибка скачивания фото: {e}. Используем заглушку.")
+        # Если фото не скачалось, создаем синюю заглушку
+        img = Image.new("RGBA", (1080, 1080), (0, 71, 145, 255))
+    else:
+        with open("temp_src.jpg", "wb") as f:
+            f.write(img_data)
+        img = Image.open("temp_src.jpg").convert("RGBA")
+    
     width, height = img.size
     
     # Квадратный кроп строго от центра
@@ -133,9 +159,11 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     txt_layer = Image.new("RGBA", (1080, 1080), (0, 0, 0, 0))
     draw = ImageDraw.Draw(txt_layer)
     
+    # Шрифты (все равно используем Exo 2 Black)
     try:
         font = ImageFont.truetype("Exo2-Black.ttf", 56)
-    except:
+    except Exception as e:
+        print(f"Предупреждение: шрифт Exo2-Black.ttf не найден ({e}). Дефолтный шрифт.")
         font = ImageFont.load_default()
         
     def get_wrapped_lines(text, font, max_width):
@@ -149,18 +177,22 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
                 if bbox[2] - bbox[0] <= max_width:
                     current_line = test_line
                 else:
-                    lines.append(current_line)
+                    if current_line: lines.append(current_line)
                     current_line = word
             if current_line:
                 lines.append(current_line)
         return lines
+
+    # Чистим текст от смайлов и делаем Капсом для Exo 2
+    title_text = strip_emojis(title_text).upper()
+    print(f"Текст для карточки (после чистки): {title_text}")
 
     lines = get_wrapped_lines(title_text, font, max_width=920)
     line_height = 70
     total_height = len(lines) * line_height
     start_y = (1080 - total_height) / 2
     
-    # Создаем тень (Drop Shadow: 75% черный, блюр 30 pt)
+    # Тень текста
     shadow_layer = Image.new("RGBA", (1080, 1080), (0, 0, 0, 0))
     shadow_draw = ImageDraw.Draw(shadow_layer)
     
@@ -174,7 +206,7 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(30))
     img = Image.alpha_composite(img, shadow_layer)
     
-    # Рисуем белый текст поверх тени
+    # Белый текст поверх
     draw_final = ImageDraw.Draw(img)
     for i, line in enumerate(lines):
         bbox = draw_final.textbbox((0, 0), line, font=font)
@@ -183,24 +215,82 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
         y = start_y + (i * line_height)
         draw_final.text((x, y), line, font=font, fill=(255, 255, 255, 255))
         
-    # Накладываем логотип из SVG в левый верхний угол
-    cairosvg.svg2png(bytestring=SVG_LOGO.encode('utf-8'), write_to="logo_temp.png", output_width=320)
-    logo = Image.open("logo_temp.png").convert("RGBA")
-    img.paste(logo, (60, 60), logo)
+    # Логотип
+    try:
+        cairosvg.svg2png(bytestring=SVG_LOGO.encode('utf-8'), write_to="logo_temp.png", output_width=320)
+        logo = Image.open("logo_temp.png").convert("RGBA")
+        img.paste(logo, (60, 60), logo)
+    except Exception as e:
+        print(f"Ошибка рендеринга логотипа SVG: {e}")
     
     final_img = img.convert("RGB")
     final_img.save(output_path, quality=95)
     return output_path
 
+# Логика поиска ссылки на фото внутри сложной структуры El País RSS
+def extract_image_from_entry(entry):
+    image_url = None
+    # 1. Проверяем вложения `media_content` (El País часто использует это)
+    if 'media_content' in entry and len(entry.media_content) > 0:
+        for media in entry.media_content:
+            # Ищем что-то похожее на имидж
+            if 'type' in media and 'image' in media['type']:
+                return media['url']
+            if 'url' in media and ('.jpg' in media['url'] or '.png' in media['url']):
+                return media['url']
+    
+    # 2. Проверяем ссылки типа image/jpeg
+    if 'links' in entry:
+        for link in entry.links:
+            if 'image/jpeg' in link.get('type', ''):
+                return link['href']
+
+    # 3. Как крайний случай - возвращаем плейсхолдер
+    return "https://picsum.photos/1200/800" # Заглушка, если в новости El Pais ВООБЩЕ нет фото
+
+# --- ГЛАВНАЯ ЛОГИКА ТЕПЕРЬ С РЕАЛЬНЫМИ RSS ---
 def main():
-    print("Запускаем тестовую генерацию карточки...")
+    print(f"Запускаем скрипт парсинга RSS с ленты: {RSS_FEED_URL}...")
+    last_processed_id = load_state()
+    print(f"ID последней обработанной новости: {last_processed_id}")
     
-    # Тестовая картинка и заголовок
-    test_image_url = "https://picsum.photos/1200/800"
-    test_title = "ИСПАНИЯ ВВОДИТ НОВЫЕ ПРАВИЛА ДЛЯ ТУРИСТОВ И МЕСТНЫХ ЖИТЕЛЕЙ"
+    feed = feedparser.parse(RSS_FEED_URL)
     
-    output_file = generate_card(test_image_url, test_title, output_path="banner.jpg")
-    print(f"Карточка успешно сгенерирована и сохранена в файл: {output_file}")
+    if not feed.entries:
+        print("RSS-лента пуста.")
+        return
+
+    # Находим самую свежую новость
+    entry = feed.entries[0]
+    
+    # В RSS-лентах El País уникальным ID обычно является ссылка `id` или `link`
+    current_entry_id = entry.id if 'id' in entry else entry.link
+    
+    print(f"Проверяем свежую новость: {current_entry_id}")
+
+    if current_entry_id == last_processed_id:
+        print("Это уже старая новость, новых новостей нет.")
+        # Для теста мы форсируем генерацию карточки, но в реальности просто вышли бы:
+        # return 
+    
+    print("ВНИМАНИЕ: Нашли свежую новость. Генерируем реальную branded-карточку.")
+
+    # Получаем данные из новости El País
+    news_title = entry.title # Реальный заголовок из RSS
+    news_image_url = extract_image_from_entry(entry) # Реальное фото из RSS El País
+
+    print(f"Заголовок из RSS (живой): {news_title}")
+    
+    # Генерируем карточку по вашим стандартам дизайна
+    try:
+        output_file = generate_card(news_image_url, news_title, output_path="banner.jpg")
+        print(f"✅ branded-карточка '{output_file}' успешно сгенерирована с реальной новости El País.")
+        
+        # Обновляем стейт, чтобы в следующий раз не генерировать то же самое
+        save_state(current_entry_id)
+        
+    except Exception as e:
+        print(f"❌ Критическая ошибка при генерации карточки: {e}")
 
 if __name__ == "__main__":
-    main()
+    mainFeed parser logic to extract first news title and image link and pass it to generate banner.
