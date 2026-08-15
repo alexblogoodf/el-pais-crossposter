@@ -193,7 +193,14 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     return output_path
 
 def main():
-    print("Скрипт запущен. Ожидание интеграции соцсетей...")
+    print("Запускаем тестовую генерацию карточки...")
+    
+    # Тестовая картинка и заголовок
+    test_image_url = "https://picsum.photos/1200/800"
+    test_title = "ИСПАНИЯ ВВОДИТ НОВЫЕ ПРАВИЛА ДЛЯ ТУРИСТОВ И МЕСТНЫХ ЖИТЕЛЕЙ"
+    
+    output_file = generate_card(test_image_url, test_title, output_path="banner.jpg")
+    print(f"Карточка успешно сгенерирована и сохранена в файл: {output_file}")
 
 if __name__ == "__main__":
     main()
