@@ -103,11 +103,9 @@ STATE_FILE = "state.json"
 
 # Функция парсинга публичной веб-версии Telegram-канала
 def get_latest_telegram_post(channel_username):
-    # Очищаем юзернейм от @
     clean_username = channel_username.replace('@', '')
     url = f"https://t.me/s/{clean_username}"
     
-    # Притворяемся обычным браузером
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
@@ -117,43 +115,56 @@ def get_latest_telegram_post(channel_username):
     response.raise_for_status()
     
     soup = BeautifulSoup(response.text, 'html.parser')
-    # Ищем все контейнеры с сообщениями
     messages = soup.find_all('div', class_='tgme_widget_message')
     
     if not messages:
         return None
         
-    # Берем самое последнее сообщение
-    latest_msg = messages[-1]
-    
-    # Уникальный ID поста (чтобы не постить дубликаты)
-    post_id = latest_msg.get('data-post', '')
-    
-    # Вытаскиваем текст (нам нужно первое предложение как заголовок)
-    text_div = latest_msg.find('div', class_='tgme_widget_message_text')
-    title = ""
-    if text_div:
-        # Разбиваем текст по строкам и берем первую непустую строку
+    # Идем с конца по списку сообщений
+    for msg in reversed(messages):
+        post_id = msg.get('data-post', '')
+        
+        # 1. Берем основной текст поста (там, где у вас заголовок с флагами)
+        text_div = msg.find('div', class_='tgme_widget_message_text')
+        if not text_div:
+            continue
+            
         raw_text = text_div.get_text(separator='\n').strip()
-        if raw_text:
-            lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
-            if lines:
-                title = lines[0]
+        lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
+        if not lines:
+            continue
             
-    # Вытаскиваем фото (из style="background-image:url('...')")
-    photo_wrap = latest_msg.find('a', class_='tgme_widget_message_photo_wrap')
-    image_url = None
-    if photo_wrap:
-        style = photo_wrap.get('style', '')
-        match = re.search(r"url\('([^']+)'\)", style)
-        if match:
-            image_url = match.group(1)
+        # Берем первую строчку как заголовок (можно убрать флаги, если мешают, или оставить)
+        title = lines[0]
+        
+        # 2. Ищем картинку внутри блока превью ссылки (link_preview)
+        image_url = None
+        preview = msg.find('a', class_='tgme_widget_message_link_preview')
+        if preview:
+            # Картинка в превью может быть спрятана в background-image у фото-контейнера
+            photo_div = preview.find('i', class_='tgme_widget_message_photo_thumb')
+            if photo_div:
+                style = photo_div.get('style', '')
+                match = re.search(r"url\('([^']+)'\)", style)
+                if match:
+                    image_url = match.group(1)
             
-    return {
-        "id": post_id,
-        "title": title,
-        "image_url": image_url
-    }
+            # Если через thumb не нашлось, попробуем поискать напрямую по стилю превью
+            if not image_url:
+                style = preview.get('style', '')
+                match = re.search(r"url\('([^']+)'\)", style)
+                if match:
+                    image_url = match.group(1)
+
+        # Если нашли и текст, и картинку из превью — возвращаем
+        if title and image_url:
+            return {
+                "id": post_id,
+                "title": title,
+                "image_url": image_url
+            }
+            
+    return None
 
 # Очистка заголовка от эмодзи (для шрифта Exo 2)
 def strip_emojis(text):
