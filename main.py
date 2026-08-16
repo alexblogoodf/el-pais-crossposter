@@ -102,7 +102,11 @@ STATE_FILE = "state.json"
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
-            return json.load(f).get("last_id", 0)
+            try:
+                data = json.load(f)
+                return int(data.get("last_id", 0))
+            except (ValueError, TypeError):
+                return 0
     return 0
 
 def save_state(post_id):
