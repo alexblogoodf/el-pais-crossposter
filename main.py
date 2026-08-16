@@ -131,27 +131,24 @@ def get_latest_post_from_channel():
 
 def extract_bold_title_and_image(post):
     text = post.get("text", "") or post.get("caption", "")
-    entities = post.get("entities", []) or post.get("caption_entities", [])
     
+    # Берем первую строчку поста как заголовок и очищаем от эмодзи и лишних пробелов
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
     title_text = ""
-    for entity in entities:
-        if entity.get("type") == "bold":
-            offset = entity.get("offset")
-            length = entity.get("length")
-            raw_title = text[offset:offset+length]
-            title_text = remove_emojis(raw_title)
-            break
-            
+    if lines:
+        title_text = remove_emojis(lines[0])
+    
     if not title_text:
-        lines = text.split("\n")
-        if lines:
-            title_text = remove_emojis(lines[0])
-            
+        title_text = "Новость ЭльПаис"
+
     image_url = None
+    
+    # 1. Сначала ищем картинку в превью ссылки (web_page -> photo_url)
     web_page = post.get("web_page")
     if web_page:
-        image_url = web_page.get("photo_url") or web_page.get("url")
+        image_url = web_page.get("photo_url")
         
+    # 2. Если нет в превью, ищем в самом посте (photo)
     if not image_url and "photo" in post:
         photos = post.get("photo")
         if photos:
@@ -165,14 +162,17 @@ def extract_bold_title_and_image(post):
     return title_text, image_url
 
 def generate_card(image_url, title_text, output_path="banner.jpg"):
-    # Если в посте нет картинки/превью, можно подставить дефолтную или создать пустой фон
     if not image_url:
         img = Image.new("RGBA", (1080, 1080), (30, 30, 30, 255))
     else:
-        img_data = requests.get(image_url).content
-        with open("temp_src.jpg", "wb") as f:
-            f.write(img_data)
-        img = Image.open("temp_src.jpg").convert("RGBA")
+        try:
+            img_data = requests.get(image_url).content
+            with open("temp_src.jpg", "wb") as f:
+                f.write(img_data)
+            img = Image.open("temp_src.jpg").convert("RGBA")
+        except Exception as e:
+            print(f"⚠️ Не удалось загрузить картинку по URL: {e}. Используем темный фон.")
+            img = Image.new("RGBA", (1080, 1080), (30, 30, 30, 255))
         
     width, height = img.size
     min_side = min(width, height)
@@ -261,7 +261,6 @@ def main():
     print(f"Заголовок: {title_text}")
     print(f"Картинка: {image_url}")
     
-    # Генерируем картинку независимо от того, был ли пост обработан ранее
     generate_card(image_url, title_text, output_path="banner.jpg")
     print("🎨 Картинка banner.jpg успешно создана!")
 
