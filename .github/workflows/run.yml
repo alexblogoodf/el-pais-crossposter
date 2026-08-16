@@ -2,8 +2,12 @@ name: Generate News Banner
 
 on:
   schedule:
-    - cron: '0 */3 * * *' # Запуск каждые 3 часа (или настройте под себя)
+    - cron: '0 */3 * * *' # Запуск каждые 3 часа
   workflow_dispatch:      # Разрешает ручной запуск из вкладки Actions
+
+# Разрешаем workflow пушить изменения обратно в репозиторий
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -22,7 +26,7 @@ jobs:
       - name: Install system dependencies (for CairoSVG)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcairo2-dev
+          sudo apt-get install -y libcairo2-dev pkg-config libffi-dev
 
       - name: Install Python dependencies
         run: |
@@ -32,10 +36,13 @@ jobs:
       - name: Run script
         run: python main.py
         env:
-          # Если для шрифта Exo2-Black.ttf нужен путь, можно положить его в корень репозитория
           PYTHONUNBUFFERED: '1'
 
-      - name: Check status of generated files
+      - name: Commit and Push banner
         run: |
-          git status
-          ls -la banner.jpg
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add banner.jpg
+          # Коммитим только если файл изменился (игнорируем ошибку, если изменений нет)
+          git commit -m "Update news banner [skip ci]" || echo "No changes to commit"
+          git push
