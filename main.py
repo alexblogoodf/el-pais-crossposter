@@ -38,13 +38,18 @@ def remove_emojis(text):
 
 
 def get_all_posts_from_rss_bridge():
+    import time
+    # Добавляем параметры для сброса кэша RSS-Bridge
+    current_time = int(time.time())
+    bridge_url = f"https://rss-bridge.org/bridge01/?action=display&username=elpaisru&bridge=TelegramBridge&format=Html&_cache_timeout=0&_t={current_time}"
+    
     headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache"
     }
     try:
-        response = requests.get(BRIDGE_URL, headers=headers, timeout=15)
+        response = requests.get(bridge_url, headers=headers, timeout=15)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
         print(f"❌ Ошибка доступа к RSS-Bridge: {e}")
@@ -61,7 +66,6 @@ def get_all_posts_from_rss_bridge():
         link = link_tag.get('href') if link_tag else None
         if not link:
             continue
-
         title_raw = ""
         hashtags = []
         text_div = item.find('div', class_='tgme_widget_message_text')
@@ -75,14 +79,12 @@ def get_all_posts_from_rss_bridge():
                 t = a.get_text().strip()
                 if t.startswith('#') and t not in hashtags:
                     hashtags.append(t)
-
         image_url = None
         blockquote = item.find('blockquote')
         if blockquote:
             img_tag = blockquote.find('img')
             if img_tag and img_tag.get('src'):
                 image_url = img_tag.get('src')
-
         posts.append({
             "link": link,
             "title_raw": title_raw or "Новость ЭльПаис",
