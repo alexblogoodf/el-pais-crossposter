@@ -1,4 +1,4 @@
 requests
 Pillow
 cairosvg
-beautifulsoup4
+telethon
