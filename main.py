@@ -125,12 +125,10 @@ def remove_emojis(text):
     return emoji_pattern.sub(r"", text).strip()
 
 def get_latest_post_from_channel():
-    """Получает последний пост из канала с помощью бота (бот должен быть администратором канала)"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     response = requests.get(url).json()
+    print("Ответ от Telegram getUpdates:", response)  # Посмотрим что приходит в логах
     
-    # Также можно использовать getChat или просматривать сообщения канала через updates
-    # Если бот добавлен как админ, канал шлет туда посты (channel_post)
     latest_post = None
     max_id = 0
     
@@ -140,7 +138,6 @@ def get_latest_post_from_channel():
             if post:
                 chat = post.get("chat", {})
                 chat_username = chat.get("username", "")
-                # Проверяем, что пост именно из нашего канала
                 if chat_username and f"@{chat_username.lower()}" == CHANNEL_USERNAME.lower():
                     post_id = post.get("message_id")
                     if post_id > max_id:
