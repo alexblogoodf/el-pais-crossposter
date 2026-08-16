@@ -6,8 +6,9 @@ import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import cairosvg
+import time
 
-BRIDGE_URL = "https://rss-bridge.org/bridge01/?action=display&username=elpaisru&bridge=TelegramBridge&format=Html"
+BRIDGE_URL = "https://rss-bridge.org/bridge01/?action=display&username=elpaisru&bridge=TelegramBridge&format=Html&_cache_timeout=0"
 HISTORY_FILE = "posted_history.json"
 PENDING_FILE = "pending_tweet.json"
 BUFFER_API = "https://api.buffer.com"
@@ -37,7 +38,11 @@ def remove_emojis(text):
 
 
 def get_all_posts_from_rss_bridge():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache"
+    }
     try:
         response = requests.get(BRIDGE_URL, headers=headers, timeout=15)
         response.raise_for_status()
