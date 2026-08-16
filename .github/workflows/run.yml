@@ -1,45 +1,39 @@
 name: El Pais Crossposter
-
 on:
   schedule:
     - cron: '0 * * * *'  # Запуск каждый час
   workflow_dispatch:      # Кнопка ручного запуска на GitHub
-
 permissions:
   contents: write         # Явное разрешение на запись в репозиторий
-
 jobs:
   run-script:
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
         persist-credentials: true
-
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.10'
-
     - name: Install system dependencies (for CairoSVG)
       run: |
         sudo apt-get update
         sudo apt-get install -y libcairo2-dev libglib2.0-dev libpng-dev
-
     - name: Install Python dependencies
       run: |
         pip install --upgrade pip
         pip install -r requirements.txt
-
     - name: Run main script
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         CHANNEL_USERNAME: ${{ secrets.CHANNEL_USERNAME }}
+        TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+        TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
       run: |
         python main.py
-
     - name: Commit state changes and image
       run: |
         git config --global user.name "github-actions[bot]"
