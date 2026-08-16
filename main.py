@@ -1,13 +1,9 @@
 import os
 import re
-import io
 import json
-import asyncio
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import cairosvg
-from telethon import TelegramClient
-from telethon.sessions import StringSession
 
 SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px"
 	 width="760px" height="180px" viewBox="0 0 760 180" enable-background="new 0 0 760 180" xml:space="preserve">
@@ -101,15 +97,12 @@ SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME")
-TELEGRAM_API_ID = int(os.environ.get("TELEGRAM_API_ID", "0") or "0")
-TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH")
 STATE_FILE = "state.json"
-HOW_MANY_TO_SCAN = 10  # сколько последних сообщений канала просматриваем
 
 
 # ---------------------------------------------------------------------------
-# УТИЛИТЫ СОСТОЯНИЯ (нужны только для дедупликации — чтобы не пересобирать
-# баннер на ту же самую новость при каждом часовом запуске)
+# УТИЛИТЫ СОСТОЯНИЯ (нужны, чтобы getUpdates не "прожигал" очередь
+# и не пропускал/не дублировал посты между запусками cron)
 # ---------------------------------------------------------------------------
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -118,7 +111,7 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"last_message_id": 0}
+    return {"last_update_id": 0, "last_message_id": 0}
 
 
 def save_state(state):
@@ -138,79 +131,168 @@ def remove_emojis(text):
 
 
 # ---------------------------------------------------------------------------
-# ПОЛУЧЕНИЕ ПОСЛЕДНЕГО ПОСТА (через Telethon / MTProto)
+# ПОЛУЧЕНИЕ ПОСЛЕДНЕГО ПОСТА
 #
-# Раньше использовался HTTP Bot API (getUpdates) — но это очередь
-# непрочитанных событий, а НЕ "лента канала". Bot API физически не умеет
-# отдать "последний пост канала" — только то, что накопилось в очереди
-# с момента последнего подтверждения (и то максимум ~24ч/100 апдейтов).
-#
-# Telethon работает по MTProto (тому же протоколу, что и обычные клиенты
-# Telegram) и умеет client.get_messages(channel, limit=N) — это буквально
-# "покажи последние N постов канала", независимо ни от какой очереди.
-# Как бонус, здесь же доступен настоящий объект превью ссылки (WebPage)
-# с полем .photo — то, что автор изначально пытался получить как
-# несуществующее в Bot API поле web_page.photo_url.
+# БАГ №1 (главная причина, почему "постов не найдено"):
+# Старый код сначала дергал getUpdates(offset=-1). По документации Telegram
+# offset=-1 означает "отдай только самый последний апдейт и сотри из очереди
+# всё до него включительно". То есть первый запрос сам же подтверждал
+# получение всех апдейтов, и следующий (настоящий) запрос getUpdates()
+# приходил уже к пустой очереди. Поэтому find latest_post почти всегда падал
+# на "не найдено". Тут это убрано, вместо этого используется offset,
+# сохранённый в state.json (тот самый файл, который ваш workflow коммитит,
+# но который скрипт раньше даже не читал).
 # ---------------------------------------------------------------------------
-async def fetch_latest_post_async(state):
-    client = TelegramClient(StringSession(), TELEGRAM_API_ID, TELEGRAM_API_HASH)
-    await client.start(bot_token=TELEGRAM_BOT_TOKEN)
+def check_and_clear_webhook():
+    """Если у бота настроен webhook, getUpdates молча возвращает пустой
+    результат без единой ошибки — именно так, как в вашем логе. Проверяем
+    и, если webhook активен, отключаем его."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+    info = requests.get(url, timeout=15).json().get("result", {})
+    webhook_url = info.get("url", "")
+    pending = info.get("pending_update_count", 0)
+    print(f"🔎 Webhook info: url={webhook_url!r}, pending_update_count={pending}")
+    if webhook_url:
+        print("⚠️ У бота активен webhook — это блокирует getUpdates. Отключаю...")
+        del_resp = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+            timeout=15
+        ).json()
+        print(f"   deleteWebhook -> {del_resp}")
+
+
+def get_latest_post_from_channel(state):
+    check_and_clear_webhook()
+
+    offset = state.get("last_update_id", 0)
+    params = {"allowed_updates": '["channel_post","edited_channel_post"]'}
+    if offset:
+        params["offset"] = offset + 1
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    response = requests.get(url, params=params, timeout=15).json()
+
+    if not response.get("ok"):
+        print(f"⚠️ Telegram API error: {response}")
+        return None, state
+
+    results = response.get("result", [])
+    print(f"🔎 Состояние перед запросом: last_update_id={offset}, "
+          f"last_message_id={state.get('last_message_id', 0)}")
+    print(f"🔎 getUpdates вернул {len(results)} апдейт(ов)")
+
+    latest_post = None
+    max_message_id = state.get("last_message_id", 0)
+    max_update_id = state.get("last_update_id", 0)
+
+    for update in results:
+        max_update_id = max(max_update_id, update["update_id"])
+        post = (
+            update.get("channel_post")
+            or update.get("edited_channel_post")
+            or update.get("message")
+        )
+        if not post:
+            print(f"   update_id={update['update_id']}: нет message/channel_post — тип: {list(update.keys())}")
+            continue
+        if not ("text" in post or "caption" in post):
+            print(f"   update_id={update['update_id']}: пост без текста/подписи, пропущен")
+            continue
+
+        chat = post.get("chat", {})
+        chat_username = chat.get("username", "")
+        print(f"   update_id={update['update_id']}: chat_username={chat_username!r} "
+              f"(ожидаем {CHANNEL_USERNAME!r}), message_id={post.get('message_id')}")
+
+        if not chat_username or chat_username.strip("@").lower() != CHANNEL_USERNAME.strip("@").lower():
+            continue
+
+        text = post.get("text", "") or post.get("caption", "")
+        if "добро пожаловать" in text.lower():
+            continue
+
+        post_id = post.get("message_id", 0)
+        if post_id > max_message_id:
+            max_message_id = post_id
+            latest_post = post
+
+    state["last_update_id"] = max_update_id
+    state["last_message_id"] = max_message_id
+    return latest_post, state
+
+
+# ---------------------------------------------------------------------------
+# ЗАГОЛОВОК + КАРТИНКА
+#
+# БАГ №2: post.get("web_page") / photo_url — этого поля НЕ существует в
+# Bot API. "web_page" с "photo_url" — это концепция клиентского MTProto API
+# (Telethon/Pyrogram), а не HTTP Bot API, которым пользуется этот скрипт.
+# Поэтому image_url всегда был None для постов со ссылкой (как у вас на
+# скриншоте — просто текст + превью ссылки, без вложенной фотографии),
+# и всегда рисовался тёмный фон вместо картинки статьи.
+#
+# Исправление: достаём URL статьи из entities поста (text_link/url),
+# идём на страницу El País и парсим её og:image.
+# ---------------------------------------------------------------------------
+def extract_article_url(post):
+    text = post.get("text", "") or post.get("caption", "")
+    entities = post.get("entities", []) or post.get("caption_entities", [])
+
+    for ent in entities:
+        if ent.get("type") == "text_link" and ent.get("url"):
+            return ent["url"]
+        if ent.get("type") == "url":
+            offset, length = ent["offset"], ent["length"]
+            # offsets are UTF-16 code units; text here is short enough that
+            # a direct slice works for typical latin/cyrillic content
+            return text[offset:offset + length]
+    return None
+
+
+def fetch_og_image(article_url):
+    if not article_url:
+        return None
     try:
-        channel = await client.get_entity(CHANNEL_USERNAME)
-        messages = await client.get_messages(channel, limit=HOW_MANY_TO_SCAN)
-        print(f"🔎 Просмотрено последних сообщений канала: {len(messages)}")
-
-        last_message_id = state.get("last_message_id", 0)
-        chosen = None
-        for msg in messages:
-            text = msg.message or ""
-            print(f"   id={msg.id}: {'(без текста)' if not text else text[:60].replace(chr(10), ' ')}")
-            if not text:
-                continue
-            if "добро пожаловать" in text.lower():
-                continue
-            chosen = msg
-            break  # messages идут от самого нового к старому — первый подходящий и есть последний пост
-
-        if chosen is None:
-            return None, None, state
-
-        if chosen.id <= last_message_id:
-            print(f"ℹ️ Последний найденный пост (id={chosen.id}) уже был обработан ранее.")
-            return None, None, state
-
-        title_text, image_bytes = await extract_title_and_image_async(client, chosen)
-        state["last_message_id"] = chosen.id
-        return title_text, image_bytes, state
-    finally:
-        await client.disconnect()
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; ElPaisCrossposter/1.0)"}
+        resp = requests.get(article_url, headers=headers, timeout=15)
+        match = re.search(
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            resp.text
+        )
+        if match:
+            return match.group(1)
+    except Exception as e:
+        print(f"⚠️ Не удалось получить og:image со страницы статьи: {e}")
+    return None
 
 
-async def extract_title_and_image_async(client, msg):
-    text = msg.message or ""
+def extract_bold_title_and_image(post):
+    text = post.get("text", "") or post.get("caption", "")
+
     lines = [line.strip() for line in text.split("\n") if line.strip()]
-    title_text = remove_emojis(lines[0]) if lines else "Новость ЭльПаис"
+    title_text = remove_emojis(lines[0]) if lines else ""
+    if not title_text:
+        title_text = "Новость ЭльПаис"
 
-    image_bytes = None
+    image_url = None
 
     # 1. Фото, приложенное непосредственно к посту
-    if msg.photo:
-        buf = io.BytesIO()
-        await client.download_media(msg.photo, file=buf)
-        image_bytes = buf.getvalue()
+    if "photo" in post:
+        photos = post.get("photo")
+        if photos:
+            file_id = photos[-1].get("file_id")
+            file_info_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile"
+            file_resp = requests.get(file_info_url, params={"file_id": file_id}, timeout=15).json()
+            if file_resp.get("ok"):
+                file_path = file_resp["result"]["file_path"]
+                image_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
 
-    # 2. Иначе — картинка из превью ссылки (настоящий WebPage.photo)
-    if not image_bytes and msg.web_preview and msg.web_preview.photo:
-        buf = io.BytesIO()
-        await client.download_media(msg.web_preview.photo, file=buf)
-        image_bytes = buf.getvalue()
+    # 2. Иначе — картинка со страницы статьи (og:image)
+    if not image_url:
+        article_url = extract_article_url(post)
+        image_url = fetch_og_image(article_url)
 
-    return title_text, image_bytes
-
-
-def get_latest_post(state):
-    """Синхронная обёртка над Telethon-корутиной."""
-    return asyncio.run(fetch_latest_post_async(state))
+    return title_text, image_url
 
 
 # ---------------------------------------------------------------------------
@@ -225,14 +307,17 @@ def load_headline_font(size=56):
     return ImageFont.load_default()
 
 
-def generate_card(image_bytes, title_text, output_path="banner.jpg"):
-    if not image_bytes:
+def generate_card(image_url, title_text, output_path="banner.jpg"):
+    if not image_url:
         img = Image.new("RGBA", (1080, 1080), (30, 30, 30, 255))
     else:
         try:
-            img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+            img_data = requests.get(image_url, timeout=15).content
+            with open("temp_src.jpg", "wb") as f:
+                f.write(img_data)
+            img = Image.open("temp_src.jpg").convert("RGBA")
         except Exception as e:
-            print(f"⚠️ Не удалось открыть скачанную картинку: {e}. Используем темный фон.")
+            print(f"⚠️ Не удалось загрузить картинку по URL: {e}. Используем темный фон.")
             img = Image.new("RGBA", (1080, 1080), (30, 30, 30, 255))
 
     width, height = img.size
@@ -309,18 +394,21 @@ def main():
     print(f"Проверяем канал: {CHANNEL_USERNAME}")
     state = load_state()
 
-    title_text, image_bytes, state = get_latest_post(state)
+    latest_post, state = get_latest_post_from_channel(state)
     save_state(state)  # сохраняем прогресс в любом случае, чтобы не застрять
 
-    if not title_text:
+    if not latest_post:
         print("❌ Новых постов для обработки нет.")
         return
 
-    print(f"✅ Взят пост, обработан. id={state.get('last_message_id')}")
-    print(f"Заголовок: {title_text}")
-    print(f"Картинка найдена: {'да' if image_bytes else 'нет (будет темный фон)'}")
+    post_id = latest_post.get("message_id")
+    print(f"✅ Взят последний пост ID: {post_id}")
 
-    generate_card(image_bytes, title_text, output_path="banner.jpg")
+    title_text, image_url = extract_bold_title_and_image(latest_post)
+    print(f"Заголовок: {title_text}")
+    print(f"Картинка: {image_url}")
+
+    generate_card(image_url, title_text, output_path="banner.jpg")
     print("🎨 Картинка banner.jpg успешно создана!")
 
 
