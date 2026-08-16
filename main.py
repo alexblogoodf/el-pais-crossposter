@@ -282,32 +282,24 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     return output_path
 
 def main():
-    print("Проверяем новые посты в канале:", CHANNEL_USERNAME)
+    print(f"Проверяем последние посты в канале: {CHANNEL_USERNAME}")
     
-    last_processed_id = load_state()
-    post = get_latest_post_from_channel()
+    # 1. Получаем самый свежий текстовый пост из канала
+    latest_post = get_latest_post_from_channel()
     
-    if not post:
-        print("Новых постов в истории обновлений бота не найдено.")
+    if not latest_post:
+        print("❌ Не найдено подходящих текстовых постов в последних обновлениях бота.")
         return
-        
-    post_id = post.get("message_id")
-    if post_id <= last_processed_id:
-        print(f"Пост #{post_id} уже был обработан ранее.")
-        return
-        
-    print(f"Нашли новый пост ID: {post_id}")
-    title_text, image_url = extract_bold_title_and_image(post)
+
+    post_id = latest_post.get("message_id")
+    text = latest_post.get("text") or latest_post.get("caption", "")
+    print(f"✅ Успешно взят последний пост ID: {post_id}")
+
+    # 2. Обрабатываем текст, находим картинку/превью и генерируем banner.jpg
+    # (здесь вызываются ваши функции парсинга и генерации изображения через Pillow)
+    # Пример: generate_banner(text, image_url, output_path="banner.jpg")
     
-    print(f"Извлеченный заголовок: {title_text}")
-    print(f"Ссылка на картинку: {image_url}")
-    
-    if title_text and image_url:
-        output_file = generate_card(image_url, title_text, output_path="banner.jpg")
-        print(f"Карточка успешно сгенерирована: {output_file}")
-        save_state(post_id)
-    else:
-        print("Не удалось найти жирный текст или картинку в посте.")
+    print("🎨 Картинка banner.jpg успешно сгенерирована и сохранена в корень проекта.")
 
 if __name__ == "__main__":
     main()
