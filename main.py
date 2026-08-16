@@ -288,7 +288,7 @@ def main():
         print(f"Пост #{post_id} уже был обработан ранее.")
         return
         
-    print(, Нашли новый пост ID: {post_id})
+    print(f"Нашли новый пост ID: {post_id}")
     title_text, image_url = extract_bold_title_and_image(post)
     
     print(f"Извлеченный заголовок: {title_text}")
