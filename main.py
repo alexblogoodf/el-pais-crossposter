@@ -1,10 +1,11 @@
 import os
 import re
-import json
 import requests
+from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import cairosvg
 
+# Ваш SVG логотип
 SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px"
 	 width="760px" height="180px" viewBox="0 0 760 180" enable-background="new 0 0 760 180" xml:space="preserve">
 <g>
@@ -95,29 +96,7 @@ SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg"
 </g>
 </svg>"""
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME")
-STATE_FILE = "state.json"
-
-
-# ---------------------------------------------------------------------------
-# УТИЛИТЫ СОСТОЯНИЯ (нужны, чтобы getUpdates не "прожигал" очередь
-# и не пропускал/не дублировал посты между запусками cron)
-# ---------------------------------------------------------------------------
-def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"last_update_id": 0, "last_message_id": 0}
-
-
-def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f)
-
+BRIDGE_URL = "https://rss-bridge.org/bridge01/?action=display&username=elpaisru&bridge=TelegramBridge&format=Html"
 
 def remove_emojis(text):
     emoji_pattern = re.compile(
@@ -129,215 +108,79 @@ def remove_emojis(text):
     )
     return emoji_pattern.sub(r"", text).strip()
 
-
-# ---------------------------------------------------------------------------
-# ПОЛУЧЕНИЕ ПОСЛЕДНЕГО ПОСТА
-#
-# БАГ №1 (главная причина, почему "постов не найдено"):
-# Старый код сначала дергал getUpdates(offset=-1). По документации Telegram
-# offset=-1 означает "отдай только самый последний апдейт и сотри из очереди
-# всё до него включительно". То есть первый запрос сам же подтверждал
-# получение всех апдейтов, и следующий (настоящий) запрос getUpdates()
-# приходил уже к пустой очереди. Поэтому find latest_post почти всегда падал
-# на "не найдено". Тут это убрано, вместо этого используется offset,
-# сохранённый в state.json (тот самый файл, который ваш workflow коммитит,
-# но который скрипт раньше даже не читал).
-# ---------------------------------------------------------------------------
-def check_and_clear_webhook():
-    """Если у бота настроен webhook, getUpdates молча возвращает пустой
-    результат без единой ошибки — именно так, как в вашем логе. Проверяем
-    и, если webhook активен, отключаем его."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo"
-    info = requests.get(url, timeout=15).json().get("result", {})
-    webhook_url = info.get("url", "")
-    pending = info.get("pending_update_count", 0)
-    print(f"🔎 Webhook info: url={webhook_url!r}, pending_update_count={pending}")
-    if webhook_url:
-        print("⚠️ У бота активен webhook — это блокирует getUpdates. Отключаю...")
-        del_resp = requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
-            timeout=15
-        ).json()
-        print(f"   deleteWebhook -> {del_resp}")
-
-
-def get_latest_post_from_channel(state):
-    check_and_clear_webhook()
-
-    offset = state.get("last_update_id", 0)
-    params = {"allowed_updates": '["channel_post","edited_channel_post"]'}
-    if offset:
-        params["offset"] = offset + 1
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    response = requests.get(url, params=params, timeout=15).json()
-
-    if not response.get("ok"):
-        print(f"⚠️ Telegram API error: {response}")
-        return None, state
-
-    results = response.get("result", [])
-    print(f"🔎 Состояние перед запросом: last_update_id={offset}, "
-          f"last_message_id={state.get('last_message_id', 0)}")
-    print(f"🔎 getUpdates вернул {len(results)} апдейт(ов)")
-
-    latest_post = None
-    max_message_id = state.get("last_message_id", 0)
-    max_update_id = state.get("last_update_id", 0)
-
-    for update in results:
-        max_update_id = max(max_update_id, update["update_id"])
-        post = (
-            update.get("channel_post")
-            or update.get("edited_channel_post")
-            or update.get("message")
-        )
-        if not post:
-            print(f"   update_id={update['update_id']}: нет message/channel_post — тип: {list(update.keys())}")
-            continue
-        if not ("text" in post or "caption" in post):
-            print(f"   update_id={update['update_id']}: пост без текста/подписи, пропущен")
-            continue
-
-        chat = post.get("chat", {})
-        chat_username = chat.get("username", "")
-        print(f"   update_id={update['update_id']}: chat_username={chat_username!r} "
-              f"(ожидаем {CHANNEL_USERNAME!r}), message_id={post.get('message_id')}")
-
-        if not chat_username or chat_username.strip("@").lower() != CHANNEL_USERNAME.strip("@").lower():
-            continue
-
-        text = post.get("text", "") or post.get("caption", "")
-        if "добро пожаловать" in text.lower():
-            continue
-
-        post_id = post.get("message_id", 0)
-        if post_id > max_message_id:
-            max_message_id = post_id
-            latest_post = post
-
-    state["last_update_id"] = max_update_id
-    state["last_message_id"] = max_message_id
-    return latest_post, state
-
-
-# ---------------------------------------------------------------------------
-# ЗАГОЛОВОК + КАРТИНКА
-#
-# БАГ №2: post.get("web_page") / photo_url — этого поля НЕ существует в
-# Bot API. "web_page" с "photo_url" — это концепция клиентского MTProto API
-# (Telethon/Pyrogram), а не HTTP Bot API, которым пользуется этот скрипт.
-# Поэтому image_url всегда был None для постов со ссылкой (как у вас на
-# скриншоте — просто текст + превью ссылки, без вложенной фотографии),
-# и всегда рисовался тёмный фон вместо картинки статьи.
-#
-# Исправление: достаём URL статьи из entities поста (text_link/url),
-# идём на страницу El País и парсим её og:image.
-# ---------------------------------------------------------------------------
-def extract_article_url(post):
-    text = post.get("text", "") or post.get("caption", "")
-    entities = post.get("entities", []) or post.get("caption_entities", [])
-
-    for ent in entities:
-        if ent.get("type") == "text_link" and ent.get("url"):
-            return ent["url"]
-        if ent.get("type") == "url":
-            offset, length = ent["offset"], ent["length"]
-            # offsets are UTF-16 code units; text here is short enough that
-            # a direct slice works for typical latin/cyrillic content
-            return text[offset:offset + length]
-    return None
-
-
-def fetch_og_image(article_url):
-    if not article_url:
-        return None
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; ElPaisCrossposter/1.0)"}
-        resp = requests.get(article_url, headers=headers, timeout=15)
-        match = re.search(
-            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-            resp.text
-        )
-        if match:
-            return match.group(1)
-    except Exception as e:
-        print(f"⚠️ Не удалось получить og:image со страницы статьи: {e}")
-    return None
-
-
-def extract_bold_title_and_image(post):
-    text = post.get("text", "") or post.get("caption", "")
-
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-    title_text = remove_emojis(lines[0]) if lines else ""
-    if not title_text:
-        title_text = "Новость ЭльПаис"
-
+def get_latest_post_from_rss_bridge():
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(BRIDGE_URL, headers=headers)
+    
+    if response.status_code != 200:
+        print(f"❌ Ошибка доступа к RSS-Bridge: {response.status_code}")
+        return None, None
+        
+    soup = BeautifulSoup(response.text, 'html.parser')
+    
+    # RSS-Bridge в HTML формате выдает посты в тегах <div class="item"> или аналогичных
+    items = soup.find_all('div', class_='item') or soup.find_all('item')
+    
+    if not items:
+        # Пробуем найти через стандартные блоки RSS-Bridge HTML
+        items = soup.find_all('section', class_='item')
+        if not items:
+            print("❌ Не найдено элементов на странице RSS-Bridge.")
+            return None, None
+            
+    # Берем самый первый (последний по времени) элемент
+    latest_item = items[0]
+    
+    # Ищем текст поста (обычно внутри элемента описания/контента)
+    content_elem = latest_item.find('div', class_='content') or latest_item.find('p')
+    raw_text = content_elem.get_text(separator="\n") if content_elem else latest_item.get_text()
+    
+    # Чистим текст и берем первую строку как заголовок
+    lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
+    title_text = remove_emojis(lines[0]) if lines else "Новость ЭльПаис"
+    
+    # Ищем картинку внутри поста
     image_url = None
-
-    # 1. Фото, приложенное непосредственно к посту
-    if "photo" in post:
-        photos = post.get("photo")
-        if photos:
-            file_id = photos[-1].get("file_id")
-            file_info_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile"
-            file_resp = requests.get(file_info_url, params={"file_id": file_id}, timeout=15).json()
-            if file_resp.get("ok"):
-                file_path = file_resp["result"]["file_path"]
-                image_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-
-    # 2. Иначе — картинка со страницы статьи (og:image)
-    if not image_url:
-        article_url = extract_article_url(post)
-        image_url = fetch_og_image(article_url)
-
+    img_tag = latest_item.find('img')
+    if img_tag and img_tag.get('src'):
+        image_url = img_tag.get('src')
+        
     return title_text, image_url
-
-
-# ---------------------------------------------------------------------------
-# ГЕНЕРАЦИЯ КАРТОЧКИ
-# ---------------------------------------------------------------------------
-def load_headline_font(size=56):
-    for path in ("Exo2-Black.ttf", "./Exo2-Black.ttf", "/usr/share/fonts/truetype/exo2/Exo2-Black.ttf"):
-        if os.path.exists(path):
-            return ImageFont.truetype(path, size)
-    print("⚠️ Exo2-Black.ttf не найден рядом со скриптом — используется системный шрифт по умолчанию "
-          "(текст будет мелким). Положите .ttf файл в корень репозитория.")
-    return ImageFont.load_default()
-
 
 def generate_card(image_url, title_text, output_path="banner.jpg"):
     if not image_url:
         img = Image.new("RGBA", (1080, 1080), (30, 30, 30, 255))
     else:
         try:
-            img_data = requests.get(image_url, timeout=15).content
+            img_data = requests.get(image_url).content
             with open("temp_src.jpg", "wb") as f:
                 f.write(img_data)
             img = Image.open("temp_src.jpg").convert("RGBA")
         except Exception as e:
-            print(f"⚠️ Не удалось загрузить картинку по URL: {e}. Используем темный фон.")
+            print(f"⚠️ Не удалось загрузить картинку: {e}. Используем темный фон.")
             img = Image.new("RGBA", (1080, 1080), (30, 30, 30, 255))
-
+        
     width, height = img.size
     min_side = min(width, height)
     left = (width - min_side) / 2
     top = (height - min_side) / 2
     right = (width + min_side) / 2
     bottom = (height + min_side) / 2
-
+    
     img = img.crop((left, top, right, bottom))
     img = img.resize((1080, 1080), Image.Resampling.LANCZOS)
-
+    
     overlay = Image.new("RGBA", (1080, 1080), (0, 0, 0, 102))
     img = Image.alpha_composite(img, overlay)
-
+    
     txt_layer = Image.new("RGBA", (1080, 1080), (0, 0, 0, 0))
     draw = ImageDraw.Draw(txt_layer)
-
-    font = load_headline_font(56)
-
+    
+    try:
+        font = ImageFont.truetype("Exo2-Black.ttf", 56)
+    except:
+        font = ImageFont.load_default()
+        
     def get_wrapped_lines(text, font, max_width):
         lines = []
         for paragraph in text.split("\n"):
@@ -359,20 +202,20 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     line_height = 70
     total_height = len(lines) * line_height
     start_y = (1080 - total_height) / 2
-
+    
     shadow_layer = Image.new("RGBA", (1080, 1080), (0, 0, 0, 0))
     shadow_draw = ImageDraw.Draw(shadow_layer)
-
+    
     for i, line in enumerate(lines):
         bbox = draw.textbbox((0, 0), line, font=font)
         w = bbox[2] - bbox[0]
         x = (1080 - w) / 2
         y = start_y + (i * line_height)
         shadow_draw.text((x, y), line, font=font, fill=(0, 0, 0, 191))
-
+        
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(30))
     img = Image.alpha_composite(img, shadow_layer)
-
+    
     draw_final = ImageDraw.Draw(img)
     for i, line in enumerate(lines):
         bbox = draw_final.textbbox((0, 0), line, font=font)
@@ -380,37 +223,28 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
         x = (1080 - w) / 2
         y = start_y + (i * line_height)
         draw_final.text((x, y), line, font=font, fill=(255, 255, 255, 255))
-
-    cairosvg.svg2png(bytestring=SVG_LOGO.encode("utf-8"), write_to="logo_temp.png", output_width=320)
+        
+    cairosvg.svg2png(bytestring=SVG_LOGO.encode('utf-8'), write_to="logo_temp.png", output_width=320)
     logo = Image.open("logo_temp.png").convert("RGBA")
     img.paste(logo, (60, 60), logo)
-
+    
     final_img = img.convert("RGB")
     final_img.save(output_path, quality=95)
     return output_path
 
-
 def main():
-    print(f"Проверяем канал: {CHANNEL_USERNAME}")
-    state = load_state()
-
-    latest_post, state = get_latest_post_from_channel(state)
-    save_state(state)  # сохраняем прогресс в любом случае, чтобы не застрять
-
-    if not latest_post:
-        print("❌ Новых постов для обработки нет.")
+    print("Получаем новость из RSS-Bridge...")
+    title_text, image_url = get_latest_post_from_rss_bridge()
+    
+    if not title_text:
+        print("❌ Не удалось получить текст из RSS-Bridge.")
         return
-
-    post_id = latest_post.get("message_id")
-    print(f"✅ Взят последний пост ID: {post_id}")
-
-    title_text, image_url = extract_bold_title_and_image(latest_post)
+        
     print(f"Заголовок: {title_text}")
     print(f"Картинка: {image_url}")
-
+    
     generate_card(image_url, title_text, output_path="banner.jpg")
     print("🎨 Картинка banner.jpg успешно создана!")
-
 
 if __name__ == "__main__":
     main()
