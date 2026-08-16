@@ -1,10 +1,10 @@
 import os
 import re
+import json
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import cairosvg
 
-# Ваш SVG логотип
 SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px"
 	 width="760px" height="180px" viewBox="0 0 760 180" enable-background="new 0 0 760 180" xml:space="preserve">
 <g>
@@ -97,6 +97,27 @@ SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME")
+STATE_FILE = "state.json"
+
+
+# ---------------------------------------------------------------------------
+# УТИЛИТЫ СОСТОЯНИЯ (нужны, чтобы getUpdates не "прожигал" очередь
+# и не пропускал/не дублировал посты между запусками cron)
+# ---------------------------------------------------------------------------
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"last_update_id": 0, "last_message_id": 0}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
 
 def remove_emojis(text):
     emoji_pattern = re.compile(
@@ -108,105 +129,179 @@ def remove_emojis(text):
     )
     return emoji_pattern.sub(r"", text).strip()
 
-def get_latest_post_from_channel():
-    # Очищаем очередь и запрашиваем последние апдейты с офсетом -1
-    url_clear = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset=-1&allowed_updates=[\"channel_post\"]"
-    requests.get(url_clear)
-    
-    # Финальный запрос свежих данных
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?allowed_updates=[\"channel_post\"]"
-    response = requests.get(url).json()
-    
+
+# ---------------------------------------------------------------------------
+# ПОЛУЧЕНИЕ ПОСЛЕДНЕГО ПОСТА
+#
+# БАГ №1 (главная причина, почему "постов не найдено"):
+# Старый код сначала дергал getUpdates(offset=-1). По документации Telegram
+# offset=-1 означает "отдай только самый последний апдейт и сотри из очереди
+# всё до него включительно". То есть первый запрос сам же подтверждал
+# получение всех апдейтов, и следующий (настоящий) запрос getUpdates()
+# приходил уже к пустой очереди. Поэтому find latest_post почти всегда падал
+# на "не найдено". Тут это убрано, вместо этого используется offset,
+# сохранённый в state.json (тот самый файл, который ваш workflow коммитит,
+# но который скрипт раньше даже не читал).
+# ---------------------------------------------------------------------------
+def get_latest_post_from_channel(state):
+    offset = state.get("last_update_id", 0)
+    params = {"allowed_updates": '["channel_post"]'}
+    if offset:
+        params["offset"] = offset + 1
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    response = requests.get(url, params=params, timeout=15).json()
+
+    if not response.get("ok"):
+        print(f"⚠️ Telegram API error: {response}")
+        return None, state
+
     latest_post = None
-    max_id = 0
-    
-    if "result" in response:
-        for update in response["result"]:
-            # Проверяем как channel_post, так и обычное сообщение на случай пересылки/тестов
-            post = update.get("channel_post") or update.get("message")
-            if post and ("text" in post or "caption" in post):
-                chat = post.get("chat", {})
-                chat_username = chat.get("username", "")
-                
-                # Проверяем совпадение канала
-                if chat_username and chat_username.strip("@").lower() == CHANNEL_USERNAME.strip("@").lower():
-                    text = post.get("text", "") or post.get("caption", "")
-                    if "добро пожаловать" in text.lower():
-                        continue
-                        
-                    post_id = post.get("message_id")
-                    if post_id > max_id:
-                        max_id = post_id
-                        latest_post = post
-                        
-    return latest_post
+    max_message_id = state.get("last_message_id", 0)
+    max_update_id = state.get("last_update_id", 0)
+
+    for update in response.get("result", []):
+        max_update_id = max(max_update_id, update["update_id"])
+        post = update.get("channel_post") or update.get("message")
+        if not post or not ("text" in post or "caption" in post):
+            continue
+
+        chat = post.get("chat", {})
+        chat_username = chat.get("username", "")
+        if not chat_username or chat_username.strip("@").lower() != CHANNEL_USERNAME.strip("@").lower():
+            continue
+
+        text = post.get("text", "") or post.get("caption", "")
+        if "добро пожаловать" in text.lower():
+            continue
+
+        post_id = post.get("message_id", 0)
+        if post_id > max_message_id:
+            max_message_id = post_id
+            latest_post = post
+
+    state["last_update_id"] = max_update_id
+    state["last_message_id"] = max_message_id
+    return latest_post, state
+
+
+# ---------------------------------------------------------------------------
+# ЗАГОЛОВОК + КАРТИНКА
+#
+# БАГ №2: post.get("web_page") / photo_url — этого поля НЕ существует в
+# Bot API. "web_page" с "photo_url" — это концепция клиентского MTProto API
+# (Telethon/Pyrogram), а не HTTP Bot API, которым пользуется этот скрипт.
+# Поэтому image_url всегда был None для постов со ссылкой (как у вас на
+# скриншоте — просто текст + превью ссылки, без вложенной фотографии),
+# и всегда рисовался тёмный фон вместо картинки статьи.
+#
+# Исправление: достаём URL статьи из entities поста (text_link/url),
+# идём на страницу El País и парсим её og:image.
+# ---------------------------------------------------------------------------
+def extract_article_url(post):
+    text = post.get("text", "") or post.get("caption", "")
+    entities = post.get("entities", []) or post.get("caption_entities", [])
+
+    for ent in entities:
+        if ent.get("type") == "text_link" and ent.get("url"):
+            return ent["url"]
+        if ent.get("type") == "url":
+            offset, length = ent["offset"], ent["length"]
+            # offsets are UTF-16 code units; text here is short enough that
+            # a direct slice works for typical latin/cyrillic content
+            return text[offset:offset + length]
+    return None
+
+
+def fetch_og_image(article_url):
+    if not article_url:
+        return None
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; ElPaisCrossposter/1.0)"}
+        resp = requests.get(article_url, headers=headers, timeout=15)
+        match = re.search(
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            resp.text
+        )
+        if match:
+            return match.group(1)
+    except Exception as e:
+        print(f"⚠️ Не удалось получить og:image со страницы статьи: {e}")
+    return None
+
 
 def extract_bold_title_and_image(post):
     text = post.get("text", "") or post.get("caption", "")
-    
-    # Берем первую строчку поста как заголовок и очищаем от эмодзи и лишних пробелов
+
     lines = [line.strip() for line in text.split("\n") if line.strip()]
-    title_text = ""
-    if lines:
-        title_text = remove_emojis(lines[0])
-    
+    title_text = remove_emojis(lines[0]) if lines else ""
     if not title_text:
         title_text = "Новость ЭльПаис"
 
     image_url = None
-    
-    # 1. Сначала ищем картинку в превью ссылки (web_page -> photo_url)
-    web_page = post.get("web_page")
-    if web_page:
-        image_url = web_page.get("photo_url")
-        
-    # 2. Если нет в превью, ищем в самом посте (photo)
-    if not image_url and "photo" in post:
+
+    # 1. Фото, приложенное непосредственно к посту
+    if "photo" in post:
         photos = post.get("photo")
         if photos:
             file_id = photos[-1].get("file_id")
-            file_info_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}"
-            file_resp = requests.get(file_info_url).json()
+            file_info_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile"
+            file_resp = requests.get(file_info_url, params={"file_id": file_id}, timeout=15).json()
             if file_resp.get("ok"):
                 file_path = file_resp["result"]["file_path"]
                 image_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-                
+
+    # 2. Иначе — картинка со страницы статьи (og:image)
+    if not image_url:
+        article_url = extract_article_url(post)
+        image_url = fetch_og_image(article_url)
+
     return title_text, image_url
+
+
+# ---------------------------------------------------------------------------
+# ГЕНЕРАЦИЯ КАРТОЧКИ
+# ---------------------------------------------------------------------------
+def load_headline_font(size=56):
+    for path in ("Exo2-Black.ttf", "./Exo2-Black.ttf", "/usr/share/fonts/truetype/exo2/Exo2-Black.ttf"):
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size)
+    print("⚠️ Exo2-Black.ttf не найден рядом со скриптом — используется системный шрифт по умолчанию "
+          "(текст будет мелким). Положите .ttf файл в корень репозитория.")
+    return ImageFont.load_default()
+
 
 def generate_card(image_url, title_text, output_path="banner.jpg"):
     if not image_url:
         img = Image.new("RGBA", (1080, 1080), (30, 30, 30, 255))
     else:
         try:
-            img_data = requests.get(image_url).content
+            img_data = requests.get(image_url, timeout=15).content
             with open("temp_src.jpg", "wb") as f:
                 f.write(img_data)
             img = Image.open("temp_src.jpg").convert("RGBA")
         except Exception as e:
             print(f"⚠️ Не удалось загрузить картинку по URL: {e}. Используем темный фон.")
             img = Image.new("RGBA", (1080, 1080), (30, 30, 30, 255))
-        
+
     width, height = img.size
     min_side = min(width, height)
     left = (width - min_side) / 2
     top = (height - min_side) / 2
     right = (width + min_side) / 2
     bottom = (height + min_side) / 2
-    
+
     img = img.crop((left, top, right, bottom))
     img = img.resize((1080, 1080), Image.Resampling.LANCZOS)
-    
+
     overlay = Image.new("RGBA", (1080, 1080), (0, 0, 0, 102))
     img = Image.alpha_composite(img, overlay)
-    
+
     txt_layer = Image.new("RGBA", (1080, 1080), (0, 0, 0, 0))
     draw = ImageDraw.Draw(txt_layer)
-    
-    try:
-        font = ImageFont.truetype("Exo2-Black.ttf", 56)
-    except:
-        font = ImageFont.load_default()
-        
+
+    font = load_headline_font(56)
+
     def get_wrapped_lines(text, font, max_width):
         lines = []
         for paragraph in text.split("\n"):
@@ -228,20 +323,20 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     line_height = 70
     total_height = len(lines) * line_height
     start_y = (1080 - total_height) / 2
-    
+
     shadow_layer = Image.new("RGBA", (1080, 1080), (0, 0, 0, 0))
     shadow_draw = ImageDraw.Draw(shadow_layer)
-    
+
     for i, line in enumerate(lines):
         bbox = draw.textbbox((0, 0), line, font=font)
         w = bbox[2] - bbox[0]
         x = (1080 - w) / 2
         y = start_y + (i * line_height)
         shadow_draw.text((x, y), line, font=font, fill=(0, 0, 0, 191))
-        
+
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(30))
     img = Image.alpha_composite(img, shadow_layer)
-    
+
     draw_final = ImageDraw.Draw(img)
     for i, line in enumerate(lines):
         bbox = draw_final.textbbox((0, 0), line, font=font)
@@ -249,32 +344,37 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
         x = (1080 - w) / 2
         y = start_y + (i * line_height)
         draw_final.text((x, y), line, font=font, fill=(255, 255, 255, 255))
-        
-    cairosvg.svg2png(bytestring=SVG_LOGO.encode('utf-8'), write_to="logo_temp.png", output_width=320)
+
+    cairosvg.svg2png(bytestring=SVG_LOGO.encode("utf-8"), write_to="logo_temp.png", output_width=320)
     logo = Image.open("logo_temp.png").convert("RGBA")
     img.paste(logo, (60, 60), logo)
-    
+
     final_img = img.convert("RGB")
     final_img.save(output_path, quality=95)
     return output_path
 
+
 def main():
     print(f"Проверяем канал: {CHANNEL_USERNAME}")
-    latest_post = get_latest_post_from_channel()
-    
+    state = load_state()
+
+    latest_post, state = get_latest_post_from_channel(state)
+    save_state(state)  # сохраняем прогресс в любом случае, чтобы не застрять
+
     if not latest_post:
-        print("❌ Не найдено постов для обработки.")
+        print("❌ Новых постов для обработки нет.")
         return
-        
+
     post_id = latest_post.get("message_id")
     print(f"✅ Взят последний пост ID: {post_id}")
-    
+
     title_text, image_url = extract_bold_title_and_image(latest_post)
     print(f"Заголовок: {title_text}")
     print(f"Картинка: {image_url}")
-    
+
     generate_card(image_url, title_text, output_path="banner.jpg")
     print("🎨 Картинка banner.jpg успешно создана!")
+
 
 if __name__ == "__main__":
     main()
