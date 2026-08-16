@@ -99,11 +99,13 @@ SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg"
 BRIDGE_URL = "https://rss-bridge.org/bridge01/?action=display&username=elpaisru&bridge=TelegramBridge&format=Html"
 
 def remove_emojis(text):
+    # Обновленный паттерн для удаления эмодзи
     emoji_pattern = re.compile(
         r"["
         r"\U0001F000-\U0001FAFF"
         r"\U00002700-\U000027BF"
         r"\U0001F1E6-\U0001F1FF"
+        r"\u2600-\u26FF"
         r"]+", flags=re.UNICODE
     )
     return emoji_pattern.sub(r"", text).strip()
@@ -118,33 +120,35 @@ def get_latest_post_from_rss_bridge():
         
     soup = BeautifulSoup(response.text, 'html.parser')
     
-    # RSS-Bridge в HTML формате выдает посты в тегах <div class="item"> или аналогичных
-    items = soup.find_all('div', class_='item') or soup.find_all('item')
-    
-    if not items:
-        # Пробуем найти через стандартные блоки RSS-Bridge HTML
-        items = soup.find_all('section', class_='item')
-        if not items:
-            print("❌ Не найдено элементов на странице RSS-Bridge.")
-            return None, None
-            
-    # Берем самый первый (последний по времени) элемент
-    latest_item = items[0]
-    
-    # Ищем текст поста (обычно внутри элемента описания/контента)
-    content_elem = latest_item.find('div', class_='content') or latest_item.find('p')
-    raw_text = content_elem.get_text(separator="\n") if content_elem else latest_item.get_text()
-    
-    # Чистим текст и берем первую строку как заголовок
-    lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
-    title_text = remove_emojis(lines[0]) if lines else "Новость ЭльПаис"
-    
-    # Ищем картинку внутри поста
+    title_text = "Новость"
     image_url = None
-    img_tag = latest_item.find('img')
-    if img_tag and img_tag.get('src'):
-        image_url = img_tag.get('src')
+    
+    # 1. Извлекаем текст из раздела class="tgme_widget_message_text js-message_text"
+    text_div = soup.find('div', class_="tgme_widget_message_text js-message_text")
+    if text_div:
+        # Ищем жирный шрифт <b>
+        b_tag = text_div.find('b')
+        if b_tag:
+            raw_text = b_tag.get_text(strip=True)
+        else:
+            raw_text = text_div.get_text(strip=True) # Фолбэк на весь текст, если <b> не найден
         
+        title_text = remove_emojis(raw_text)
+
+    # 2. Извлекаем картинку из раздела blockquote
+    blockquote = soup.find('blockquote')
+    if blockquote:
+        img_tag = blockquote.find('img')
+        if img_tag and img_tag.get('src'):
+            image_url = img_tag.get('src')
+        else:
+            # Иногда в виджетах Telegram картинка передается через background-image
+            bg_element = blockquote.find(style=re.compile(r"background-image"))
+            if bg_element:
+                match = re.search(r"url\(['\"]?(.*?)['\"]?\)", bg_element['style'])
+                if match:
+                    image_url = match.group(1)
+
     return title_text, image_url
 
 def generate_card(image_url, title_text, output_path="banner.jpg"):
