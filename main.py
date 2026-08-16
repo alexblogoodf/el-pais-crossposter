@@ -104,7 +104,12 @@ def load_state():
         with open(STATE_FILE, "r") as f:
             try:
                 data = json.load(f)
-                return int(data.get("last_id", 0))
+                val = data.get("last_id", 0)
+                # Если в стейте строка вида "elpaisru/56", вытаскиваем из неё только цифры
+                if isinstance(val, str):
+                    numbers = re.findall(r'\d+', val)
+                    return int(numbers[-1]) if numbers else 0
+                return int(val)
             except (ValueError, TypeError):
                 return 0
     return 0
@@ -127,19 +132,21 @@ def remove_emojis(text):
 def get_latest_post_from_channel():
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     response = requests.get(url).json()
-    print("Ответ от Telegram getUpdates:", response)  # Посмотрим что приходит в логах
     
     latest_post = None
     max_id = 0
     
     if "result" in response:
         for update in response["result"]:
+            # Берем только посты канала, у которых есть текст или подпись (исключаем системные уведомления о закреплении)
             post = update.get("channel_post")
-            if post:
+            if post and ("text" in post or "caption" in post):
                 chat = post.get("chat", {})
                 chat_username = chat.get("username", "")
+                
                 if chat_username and f"@{chat_username.lower()}" == CHANNEL_USERNAME.lower():
                     post_id = post.get("message_id")
+                    # Ищем пост с самым большим ID (самый свежий)
                     if post_id > max_id:
                         max_id = post_id
                         latest_post = post
