@@ -109,12 +109,12 @@ def remove_emojis(text):
     return emoji_pattern.sub(r"", text).strip()
 
 def get_latest_post_from_channel():
-    # Сначала делаем пустой запрос с offset=-1 и limit=1, чтобы «сдвинуть» очередь Telegram
-    url_clear = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset=-1"
-    resp = requests.get(url_clear).json()
+    # Очищаем очередь и запрашиваем последние апдейты с офсетом -1
+    url_clear = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset=-1&allowed_updates=[\"channel_post\"]"
+    requests.get(url_clear)
     
-    # Теперь запрашиваем актуальные апдейты
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    # Финальный запрос свежих данных
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?allowed_updates=[\"channel_post\"]"
     response = requests.get(url).json()
     
     latest_post = None
@@ -122,12 +122,13 @@ def get_latest_post_from_channel():
     
     if "result" in response:
         for update in response["result"]:
-            post = update.get("channel_post")
+            # Проверяем как channel_post, так и обычное сообщение на случай пересылки/тестов
+            post = update.get("channel_post") or update.get("message")
             if post and ("text" in post or "caption" in post):
                 chat = post.get("chat", {})
                 chat_username = chat.get("username", "")
                 
-                # Сравниваем имя канала (убираем лишние пробелы и `@`)
+                # Проверяем совпадение канала
                 if chat_username and chat_username.strip("@").lower() == CHANNEL_USERNAME.strip("@").lower():
                     text = post.get("text", "") or post.get("caption", "")
                     if "добро пожаловать" in text.lower():
