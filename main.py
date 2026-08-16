@@ -6,9 +6,8 @@ import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import cairosvg
-import time
 
-BRIDGE_URL = "https://rss-bridge.org/bridge01/?action=display&username=elpaisru&bridge=TelegramBridge&format=Html&_cache_timeout=0"
+BRIDGE_URL = "https://rss-bridge.org/bridge01/?action=display&username=elpaisru&bridge=TelegramBridge&format=Html"
 HISTORY_FILE = "posted_history.json"
 PENDING_FILE = "pending_tweet.json"
 BUFFER_API = "https://api.buffer.com"
@@ -37,17 +36,10 @@ def remove_emojis(text):
     return emoji_pattern.sub(r'', text).strip()
 
 
-def get_all_posts_from_rss_bridge():
-    import time
-    # Добавляем параметры для сброса кэша RSS-Bridge
-    current_time = int(time.time())
-    bridge_url = f"https://rss-bridge.org/bridge01/?action=display&username=elpaisru&bridge=TelegramBridge&format=Html&_cache_timeout=0&_t={current_time}"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache"
-    }
+def get_all_posts_from_rss_bridge(cache_counter):
+    # Добавляем счётчик в URL, чтобы каждый запрос был уникальным для сервера
+    bridge_url = f"{BRIDGE_URL}&_cache_timeout={cache_counter}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         response = requests.get(bridge_url, headers=headers, timeout=15)
         response.raise_for_status()
@@ -66,6 +58,7 @@ def get_all_posts_from_rss_bridge():
         link = link_tag.get('href') if link_tag else None
         if not link:
             continue
+
         title_raw = ""
         hashtags = []
         text_div = item.find('div', class_='tgme_widget_message_text')
@@ -79,12 +72,14 @@ def get_all_posts_from_rss_bridge():
                 t = a.get_text().strip()
                 if t.startswith('#') and t not in hashtags:
                     hashtags.append(t)
+
         image_url = None
         blockquote = item.find('blockquote')
         if blockquote:
             img_tag = blockquote.find('img')
             if img_tag and img_tag.get('src'):
                 image_url = img_tag.get('src')
+
         posts.append({
             "link": link,
             "title_raw": title_raw or "Новость ЭльПаис",
@@ -200,7 +195,6 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
         draw_final.text(((1080 - (bbox[2] - bbox[0])) / 2, start_y + i * line_height),
                         line, font=font, fill=(255, 255, 255, 255))
 
-    # Логотип берётся ТОЛЬКО из файла logo.svg в корне репозитория
     try:
         if os.path.exists("logo.svg"):
             cairosvg.svg2png(url="logo.svg", write_to="logo_temp.png", output_width=320)
@@ -280,29 +274,32 @@ def load_history():
                 return json.load(f)
         except Exception as e:
             print(f"⚠️ Не удалось прочитать историю: {e}")
-    return {"processed": []}
+    return {"processed": [], "cache_counter": 1}
 
 
-def save_history(processed):
+def save_history(history):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump({"processed": sorted(processed)[-500:]}, f, ensure_ascii=False, indent=2)
+        json.dump(history, f, ensure_ascii=False, indent=2)
 
 
 def cmd_generate():
     print("Получаем новости из RSS-Bridge...")
-    posts = get_all_posts_from_rss_bridge()
+    history = load_history()
+    processed = set(history.get("processed", []))
+    cache_counter = history.get("cache_counter", 1)
+
+    posts = get_all_posts_from_rss_bridge(cache_counter)
     if not posts:
         print("❌ Не удалось получить новости.")
+        history["cache_counter"] = cache_counter + 1
+        save_history(history)
         return
 
     latest = posts[0]
     generate_card(latest["image_url"], latest["title_clean"], output_path="banner.jpg")
     print("🎨 banner.jpg (последняя новость) создан.")
 
-    first_run = not os.path.exists(HISTORY_FILE)
-    history = load_history()
-    processed = set(history.get("processed", []))
-
+    first_run = len(processed) == 0
     if first_run:
         to_post = posts[0]
         for p in posts[1:]:
@@ -326,7 +323,9 @@ def cmd_generate():
     else:
         print("😴 Новых новостей для твита нет.")
 
-    save_history(processed)
+    history["processed"] = sorted(processed)[-500:]
+    history["cache_counter"] = cache_counter + 1
+    save_history(history)
 
     if os.path.isdir("banners"):
         files = sorted(os.listdir("banners"), key=lambda n: int(re.sub(r'\D', '', n) or 0))
@@ -367,7 +366,8 @@ def cmd_post():
         history = load_history()
         processed = set(history.get("processed", []))
         processed.add(pending["link"])
-        save_history(processed)
+        history["processed"] = sorted(processed)[-500:]
+        save_history(history)
         os.remove(PENDING_FILE)
     else:
         print(f"❌ Buffer не опубликовал: {info}. Повторим в следующем запуске.")
