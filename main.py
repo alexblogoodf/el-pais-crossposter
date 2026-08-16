@@ -1,11 +1,13 @@
 import os
 import re
+import json
 import requests
+import tweepy
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import cairosvg
 
-# Ваш SVG логотип (очищен от лишних пробелов в атрибутах для корректной работы cairosvg)
+# Ваш SVG логотип — тот же блок, что был в прошлой версии (не меняй его)
 SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px"
 width="760px" height="180px" viewBox="0 0 760 180" enable-background="new 0 0 760 180" xml:space="preserve">
  <g>
@@ -97,75 +99,114 @@ c2.88,0,5.606-0.592,8.18-1.774c2.404-1.107,4.832-2.759,7.282-4.945l1.437,5.64h12
  </svg>"""
 
 BRIDGE_URL = "https://rss-bridge.org/bridge01/?action=display&username=elpaisru&bridge=TelegramBridge&format=Html"
+HISTORY_FILE = "posted_history.json"
 
 def remove_emojis(text):
-    # Расширенный regex для удаления смайлов и спецсимволов Telegram
     emoji_pattern = re.compile(
         "["
-        "\U0001F600-\U0001F64F"  # emoticons
-        "\U0001F300-\U0001F5FF"  # symbols & pictographs
-        "\U0001F680-\U0001F6FF"  # transport & map symbols
-        "\U0001F1E0-\U0001F1FF"  # flags (iOS)
+        "\U0001F600-\U0001F64F"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF"
         "\U00002702-\U000027B0"
         "\U000024C2-\U0001F251"
         "\U0001f926-\U0001f937"
         "\U00010000-\U0010ffff"
-        "\u2640-\u2642" 
+        "\u2640-\u2642"
         "\u2600-\u2B55"
         "\u200d"
         "\u23cf"
         "\u23e9"
         "\u231a"
-        "\ufe0f"  # dingbats
+        "\ufe0f"
         "\u3030"
         "]+", flags=re.UNICODE)
     return emoji_pattern.sub(r'', text).strip()
 
-def get_latest_post_from_rss_bridge():
+def get_all_posts_from_rss_bridge():
+    """Возвращает список постов (сначала самые свежие)."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         response = requests.get(BRIDGE_URL, headers=headers, timeout=15)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
         print(f"❌ Ошибка доступа к RSS-Bridge: {e}")
-        return None, None
+        return []
 
     soup = BeautifulSoup(response.text, 'html.parser')
-    
-    # В HTML формате RSS-Bridge посты лежат в section.feeditem
     items = soup.find_all('section', class_='feeditem')
     if not items:
         items = soup.find_all('div', class_='item') or soup.find_all('article')
-        
-    if not items:
-        print("❌ Не найдено элементов на странице RSS-Bridge.")
-        return None, None
 
-    latest_item = items[0]
-    
-    # 1. Ищем заголовок (жирный текст <b> внутри tgme_widget_message_text)
-    title_text = "Новость ЭльПаис"
-    text_div = latest_item.find('div', class_='tgme_widget_message_text')
-    if text_div:
-        b_tags = text_div.find_all('b')
-        if b_tags:
-            # Ищем первый <b>, в котором есть осмысленный текст, а не только смайл
-            for b in b_tags:
-                raw_text = b.get_text()
-                clean_text = remove_emojis(raw_text)
-                if clean_text:
-                    title_text = clean_text
+    posts = []
+    for item in items:
+        link_tag = item.find('a', class_='itemtitle')
+        link = link_tag.get('href') if link_tag else None
+        if not link:
+            continue
+
+        # Заголовок: первый <b> с осмысленным текстом (сырой — со смайлами для твита)
+        title_raw = ""
+        text_div = item.find('div', class_='tgme_widget_message_text')
+        if text_div:
+            for b in text_div.find_all('b'):
+                raw = b.get_text().strip()
+                if remove_emojis(raw):
+                    title_raw = raw
                     break
 
-    # 2. Ищем картинку строго внутри <blockquote>
-    image_url = None
-    blockquote = latest_item.find('blockquote')
-    if blockquote:
-        img_tag = blockquote.find('img')
-        if img_tag and img_tag.get('src'):
-            image_url = img_tag.get('src')
-            
-    return title_text, image_url
+        # Картинка из <blockquote>
+        image_url = None
+        blockquote = item.find('blockquote')
+        if blockquote:
+            img_tag = blockquote.find('img')
+            if img_tag and img_tag.get('src'):
+                image_url = img_tag.get('src')
+
+        posts.append({
+            "link": link,
+            "title_raw": title_raw or "Новость ЭльПаис",
+            "title_clean": remove_emojis(title_raw) or "Новость ЭльПаис",
+            "image_url": image_url,
+        })
+    return posts
+
+def build_tweet_text(title_raw, link):
+    """Заголовок (можно со смайлами) + ссылка, с учётом лимита 280 символов
+    (любая ссылка в твиттере считается как 23 символа t.co)."""
+    suffix = "\n\nЧитать в телеграм 👉 "
+    max_title = 280 - len(suffix) - 23
+    title = title_raw.strip()
+    if len(title) > max_title:
+        title = title[:max_title - 1].rstrip() + "…"
+    return f"{title}{suffix}{link}"
+
+def post_to_twitter(image_path, tweet_text):
+    keys = {
+        "api_key": os.environ.get("TWITTER_API_KEY", ""),
+        "api_secret": os.environ.get("TWITTER_API_SECRET", ""),
+        "access_token": os.environ.get("TWITTER_ACCESS_TOKEN", ""),
+        "access_secret": os.environ.get("TWITTER_ACCESS_TOKEN_SECRET", ""),
+    }
+    if not all(keys.values()):
+        print("⚠️ Секреты Twitter не заданы в GitHub Secrets — твит пропущен.")
+        return False
+    try:
+        auth = tweepy.OAuth1UserHandler(
+            keys["api_key"], keys["api_secret"],
+            keys["access_token"], keys["access_secret"])
+        api = tweepy.API(auth)
+        media = api.media_upload(image_path)  # грузим картинку (v1.1)
+
+        client = tweepy.Client(
+            consumer_key=keys["api_key"], consumer_secret=keys["api_secret"],
+            access_token=keys["access_token"], access_token_secret=keys["access_secret"])
+        resp = client.create_tweet(text=tweet_text, media_ids=[media.media_id_string])
+        print(f"✅ Твит опубликован, id: {resp.data['id']}")
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при публикации твита: {e}")
+        return False
 
 def generate_card(image_url, title_text, output_path="banner.jpg"):
     if not image_url:
@@ -179,7 +220,7 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
         except Exception as e:
             print(f"⚠️ Не удалось загрузить картинку: {e}. Используем темный фон.")
             img = Image.new("RGBA", (1080, 1080), (30, 30, 30, 255))
-            
+
     width, height = img.size
     min_side = min(width, height)
     left = (width - min_side) / 2
@@ -188,13 +229,13 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     bottom = (height + min_side) / 2
     img = img.crop((left, top, right, bottom))
     img = img.resize((1080, 1080), Image.Resampling.LANCZOS)
-    
+
     overlay = Image.new("RGBA", (1080, 1080), (0, 0, 0, 102))
     img = Image.alpha_composite(img, overlay)
-    
+
     txt_layer = Image.new("RGBA", (1080, 1080), (0, 0, 0, 0))
     draw = ImageDraw.Draw(txt_layer)
-    
+
     try:
         font = ImageFont.truetype("Exo2-Black.ttf", 56)
     except Exception:
@@ -222,7 +263,7 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     line_height = 70
     total_height = len(lines) * line_height
     start_y = (1080 - total_height) / 2
-    
+
     shadow_layer = Image.new("RGBA", (1080, 1080), (0, 0, 0, 0))
     shadow_draw = ImageDraw.Draw(shadow_layer)
     for i, line in enumerate(lines):
@@ -231,10 +272,10 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
         x = (1080 - w) / 2
         y = start_y + (i * line_height)
         shadow_draw.text((x, y), line, font=font, fill=(0, 0, 0, 191))
-        
+
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(30))
     img = Image.alpha_composite(img, shadow_layer)
-    
+
     draw_final = ImageDraw.Draw(img)
     for i, line in enumerate(lines):
         bbox = draw_final.textbbox((0, 0), line, font=font)
@@ -242,37 +283,76 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
         x = (1080 - w) / 2
         y = start_y + (i * line_height)
         draw_final.text((x, y), line, font=font, fill=(255, 255, 255, 255))
-        
-    # Логотип
+
     try:
         cairosvg.svg2png(bytestring=SVG_LOGO.encode('utf-8'), write_to="logo_temp.png", output_width=320)
         logo = Image.open("logo_temp.png").convert("RGBA")
         img.paste(logo, (60, 60), logo)
     except Exception as e:
         print(f"⚠️ Ошибка при добавлении логотипа: {e}")
-        
+
     final_img = img.convert("RGB")
     final_img.save(output_path, quality=95)
-    
-    # Чистим временные файлы
+
     for temp_file in ["temp_src.jpg", "logo_temp.png"]:
         if os.path.exists(temp_file):
             try: os.remove(temp_file)
             except: pass
-                
+
     return output_path
 
 def main():
-    print("Получаем новость из RSS-Bridge...")
-    title_text, image_url = get_latest_post_from_rss_bridge()
-    if not title_text:
-        print("❌ Не удалось получить текст из RSS-Bridge.")
+    print("Получаем новости из RSS-Bridge...")
+    posts = get_all_posts_from_rss_bridge()
+    if not posts:
+        print("❌ Не удалось получить новости.")
         return
-    print(f"Заголовок: {title_text}")
-    print(f"Картинка: {image_url}")
-    
-    generate_card(image_url, title_text, output_path="banner.jpg")
-    print("🎨 Картинка banner.jpg успешно создана!")
+
+    # --- ЗАДАЧА 1: banner.jpg всегда из самой свежей новости ---
+    latest = posts[0]
+    generate_card(latest["image_url"], latest["title_clean"], output_path="banner.jpg")
+    print("🎨 banner.jpg (последняя новость) создан.")
+
+    # --- ЗАДАЧА 2: очередь постов в Twitter ---
+    first_run = not os.path.exists(HISTORY_FILE)
+    history = {"processed": []}
+    if not first_run:
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        except Exception as e:
+            print(f"⚠️ Не удалось прочитать историю: {e}")
+
+    processed = set(history.get("processed", []))
+
+    if first_run:
+        # Первый запуск: постим только свежую, старые помечаем пропущенными (без спама)
+        to_post = posts[0]
+        for p in posts[1:]:
+            processed.add(p["link"])
+        print("🆕 Первый запуск: старые новости помечены как пропущенные.")
+    else:
+        # Очередь: берём САМУЮ СТАРУЮ из непостнутых, свежие ждут своего запуска
+        unposted = [p for p in reversed(posts) if p["link"] not in processed]
+        to_post = unposted[0] if unposted else None
+
+    if not to_post:
+        print("😴 Новых новостей для твита нет.")
+    else:
+        print(f"📤 Постим в Twitter: {to_post['link']}")
+        generate_card(to_post["image_url"], to_post["title_clean"], output_path="tweet_banner.jpg")
+        tweet_text = build_tweet_text(to_post["title_raw"], to_post["link"])
+        if post_to_twitter("tweet_banner.jpg", tweet_text):
+            processed.add(to_post["link"])
+        if os.path.exists("tweet_banner.jpg"):
+            try: os.remove("tweet_banner.jpg")
+            except: pass
+
+    # Сохраняем историю (workflow закоммитит её в репозиторий)
+    history["processed"] = sorted(processed)[-500:]
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+    print("💾 История обновлена.")
 
 if __name__ == "__main__":
     main()
