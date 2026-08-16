@@ -41,7 +41,7 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add -A banner.jpg banners posted_history.json pending_tweet.json || true
+          git add -A
           git commit -m "Update banner & queue [skip ci]" || echo "No changes to commit"
           git push
 
@@ -55,6 +55,6 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add -A posted_history.json pending_tweet.json || true
+          git add -A
           git commit -m "Update post history [skip ci]" || echo "No changes to commit"
           git push
