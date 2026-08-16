@@ -1,10 +1,8 @@
 import os
 import json
 import requests
-import re
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import cairosvg
-from bs4 import BeautifulSoup
 
 # Ваш SVG логотип
 SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px"
@@ -96,113 +94,29 @@ SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg"
 </g>
 </svg>"""
 
-# Извлекаем переменные окружения (токен пока не используется напрямую, но он нужен для отправки)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@elpaisru")
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME")
 STATE_FILE = "state.json"
 
-# Функция парсинга публичной веб-версии Telegram-канала
-def get_latest_telegram_post(channel_username):
-    clean_username = channel_username.replace('@', '')
-    url = f"https://t.me/s/{clean_username}"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    
-    print(f"Парсим веб-версию канала: {url}")
-    response = requests.get(url, headers=headers)
-    response.raise_for_status()
-    
-    soup = BeautifulSoup(response.text, 'html.parser')
-    messages = soup.find_all('div', class_='tgme_widget_message')
-    
-    if not messages:
-        return None
-        
-    # Идем с конца по списку сообщений
-    for msg in reversed(messages):
-        post_id = msg.get('data-post', '')
-        
-        # 1. Берем основной текст поста (там, где у вас заголовок с флагами)
-        text_div = msg.find('div', class_='tgme_widget_message_text')
-        if not text_div:
-            continue
-            
-        raw_text = text_div.get_text(separator='\n').strip()
-        lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
-        if not lines:
-            continue
-            
-        # Берем первую строчку как заголовок (можно убрать флаги, если мешают, или оставить)
-        title = lines[0]
-        
-        # 2. Ищем картинку внутри блока превью ссылки (link_preview)
-        image_url = None
-        preview = msg.find('a', class_='tgme_widget_message_link_preview')
-        if preview:
-            # Картинка в превью может быть спрятана в background-image у фото-контейнера
-            photo_div = preview.find('i', class_='tgme_widget_message_photo_thumb')
-            if photo_div:
-                style = photo_div.get('style', '')
-                match = re.search(r"url\('([^']+)'\)", style)
-                if match:
-                    image_url = match.group(1)
-            
-            # Если через thumb не нашлось, попробуем поискать напрямую по стилю превью
-            if not image_url:
-                style = preview.get('style', '')
-                match = re.search(r"url\('([^']+)'\)", style)
-                if match:
-                    image_url = match.group(1)
-
-        # Если нашли и текст, и картинку из превью — возвращаем
-        if title and image_url:
-            return {
-                "id": post_id,
-                "title": title,
-                "image_url": image_url
-            }
-            
-    return None
-
-# Очистка заголовка от эмодзи (для шрифта Exo 2)
-def strip_emojis(text):
-    if not text:
-        return ""
-    text = re.sub(r'[^\w\s.,!?-]', '', text, flags=re.UNICODE)
-    return text.strip()
-
-# Управление состоянием (чтобы не генерировать на старые посты)
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
-            try:
-                return json.load(f).get("last_id", "")
-            except json.JSONDecodeError:
-                return ""
-    return ""
+            return json.load(f).get("last_id", 0)
+    return 0
 
 def save_state(post_id):
     with open(STATE_FILE, "w") as f:
         json.dump({"last_id": post_id}, f)
 
-# Генерация самой картинки
 def generate_card(image_url, title_text, output_path="banner.jpg"):
-    print(f"Загружаем фото из Telegram: {image_url}")
-    try:
-        if image_url:
-            img_data = requests.get(image_url).content
-            with open("temp_src.jpg", "wb") as f:
-                f.write(img_data)
-            img = Image.open("temp_src.jpg").convert("RGBA")
-        else:
-            raise Exception("Нет URL картинки")
-    except Exception as e:
-        print(f"Ошибка загрузки картинки ({e}). Делаем синий фон.")
-        img = Image.new("RGBA", (1080, 1080), (0, 71, 145, 255))
-    
+    img_data = requests.get(image_url).content
+    with open("temp_src.jpg", "wb") as f:
+        f.write(img_data)
+        
+    img = Image.open("temp_src.jpg").convert("RGBA")
     width, height = img.size
+    
+    # Квадратный кроп строго от центра
     min_side = min(width, height)
     left = (width - min_side) / 2
     top = (height - min_side) / 2
@@ -212,6 +126,7 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     img = img.crop((left, top, right, bottom))
     img = img.resize((1080, 1080), Image.Resampling.LANCZOS)
     
+    # Черный фон с прозрачностью 40% (alpha = 102)
     overlay = Image.new("RGBA", (1080, 1080), (0, 0, 0, 102))
     img = Image.alpha_composite(img, overlay)
     
@@ -220,8 +135,7 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     
     try:
         font = ImageFont.truetype("Exo2-Black.ttf", 56)
-    except Exception as e:
-        print(f"Предупреждение: шрифт Exo2-Black не найден, берем дефолтный.")
+    except:
         font = ImageFont.load_default()
         
     def get_wrapped_lines(text, font, max_width):
@@ -235,21 +149,18 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
                 if bbox[2] - bbox[0] <= max_width:
                     current_line = test_line
                 else:
-                    if current_line: lines.append(current_line)
+                    lines.append(current_line)
                     current_line = word
             if current_line:
                 lines.append(current_line)
         return lines
 
-    # Чистим и капсим заголовок
-    clean_title = strip_emojis(title_text).upper()
-    print(f"Готовый заголовок для рендера: {clean_title}")
-
-    lines = get_wrapped_lines(clean_title, font, max_width=920)
+    lines = get_wrapped_lines(title_text, font, max_width=920)
     line_height = 70
     total_height = len(lines) * line_height
     start_y = (1080 - total_height) / 2
     
+    # Создаем тень (Drop Shadow: 75% черный, блюр 30 pt)
     shadow_layer = Image.new("RGBA", (1080, 1080), (0, 0, 0, 0))
     shadow_draw = ImageDraw.Draw(shadow_layer)
     
@@ -263,6 +174,7 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(30))
     img = Image.alpha_composite(img, shadow_layer)
     
+    # Рисуем белый текст поверх тени
     draw_final = ImageDraw.Draw(img)
     for i, line in enumerate(lines):
         bbox = draw_final.textbbox((0, 0), line, font=font)
@@ -271,47 +183,24 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
         y = start_y + (i * line_height)
         draw_final.text((x, y), line, font=font, fill=(255, 255, 255, 255))
         
-    try:
-        cairosvg.svg2png(bytestring=SVG_LOGO.encode('utf-8'), write_to="logo_temp.png", output_width=320)
-        logo = Image.open("logo_temp.png").convert("RGBA")
-        img.paste(logo, (60, 60), logo)
-    except Exception as e:
-        print(f"Ошибка рендеринга логотипа SVG: {e}")
+    # Накладываем логотип из SVG в левый верхний угол
+    cairosvg.svg2png(bytestring=SVG_LOGO.encode('utf-8'), write_to="logo_temp.png", output_width=320)
+    logo = Image.open("logo_temp.png").convert("RGBA")
+    img.paste(logo, (60, 60), logo)
     
     final_img = img.convert("RGB")
     final_img.save(output_path, quality=95)
     return output_path
 
-# Основная точка входа
 def main():
-    print(f"Ищем свежий пост в канале {CHANNEL_USERNAME}...")
+    print("Запускаем тестовую генерацию карточки...")
     
-    post_data = get_latest_telegram_post(CHANNEL_USERNAME)
-    if not post_data:
-        print("Не удалось получить данные с канала.")
-        return
-
-    post_id = post_data["id"]
-    title = post_data["title"]
-    image_url = post_data["image_url"]
+    # Тестовая картинка и заголовок
+    test_image_url = "https://picsum.photos/1200/800"
+    test_title = "ИСПАНИЯ ВВОДИТ НОВЫЕ ПРАВИЛА ДЛЯ ТУРИСТОВ И МЕСТНЫХ ЖИТЕЛЕЙ"
     
-    print(f"Найден пост ID: {post_id}")
-    print(f"Заголовок: {title}")
-    
-    last_processed_id = load_state()
-    
-    # Проверка на то, новая ли это новость (для тестов можно закомментировать return)
-    if post_id == last_processed_id:
-        print("Этот пост уже обработан. Завершаем работу.")
-        # return 
-        
-    print("Генерируем картинку...")
-    try:
-        output_file = generate_card(image_url, title, output_path="banner.jpg")
-        print(f"✅ Карточка успешно сохранена в '{output_file}'!")
-        save_state(post_id)
-    except Exception as e:
-        print(f"❌ Ошибка генерации: {e}")
+    output_file = generate_card(test_image_url, test_title, output_path="banner.jpg")
+    print(f"Карточка успешно сгенерирована и сохранена в файл: {output_file}")
 
 if __name__ == "__main__":
     main()
