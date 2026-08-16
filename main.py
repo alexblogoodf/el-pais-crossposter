@@ -282,8 +282,8 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
                         line, font=font, fill=(255, 255, 255, 255))
 
     try:
-     	if os.path.exists("logo.svg"):
-        	cairosvg.svg2png(url="logo.svg", write_to="logo_temp.png", output_width=320)
+        if os.path.exists("logo.svg"):
+            cairosvg.svg2png(url="logo.svg", write_to="logo_temp.png", output_width=320)
         else:
             cairosvg.svg2png(bytestring=SVG_LOGO.encode('utf-8'), write_to="logo_temp.png", output_width=320)
         logo = Image.open("logo_temp.png").convert("RGBA")
