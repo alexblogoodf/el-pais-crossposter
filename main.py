@@ -143,9 +143,29 @@ def remove_emojis(text):
 # сохранённый в state.json (тот самый файл, который ваш workflow коммитит,
 # но который скрипт раньше даже не читал).
 # ---------------------------------------------------------------------------
+def check_and_clear_webhook():
+    """Если у бота настроен webhook, getUpdates молча возвращает пустой
+    результат без единой ошибки — именно так, как в вашем логе. Проверяем
+    и, если webhook активен, отключаем его."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo"
+    info = requests.get(url, timeout=15).json().get("result", {})
+    webhook_url = info.get("url", "")
+    pending = info.get("pending_update_count", 0)
+    print(f"🔎 Webhook info: url={webhook_url!r}, pending_update_count={pending}")
+    if webhook_url:
+        print("⚠️ У бота активен webhook — это блокирует getUpdates. Отключаю...")
+        del_resp = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+            timeout=15
+        ).json()
+        print(f"   deleteWebhook -> {del_resp}")
+
+
 def get_latest_post_from_channel(state):
+    check_and_clear_webhook()
+
     offset = state.get("last_update_id", 0)
-    params = {"allowed_updates": '["channel_post"]'}
+    params = {"allowed_updates": '["channel_post","edited_channel_post"]'}
     if offset:
         params["offset"] = offset + 1
 
@@ -156,18 +176,34 @@ def get_latest_post_from_channel(state):
         print(f"⚠️ Telegram API error: {response}")
         return None, state
 
+    results = response.get("result", [])
+    print(f"🔎 Состояние перед запросом: last_update_id={offset}, "
+          f"last_message_id={state.get('last_message_id', 0)}")
+    print(f"🔎 getUpdates вернул {len(results)} апдейт(ов)")
+
     latest_post = None
     max_message_id = state.get("last_message_id", 0)
     max_update_id = state.get("last_update_id", 0)
 
-    for update in response.get("result", []):
+    for update in results:
         max_update_id = max(max_update_id, update["update_id"])
-        post = update.get("channel_post") or update.get("message")
-        if not post or not ("text" in post or "caption" in post):
+        post = (
+            update.get("channel_post")
+            or update.get("edited_channel_post")
+            or update.get("message")
+        )
+        if not post:
+            print(f"   update_id={update['update_id']}: нет message/channel_post — тип: {list(update.keys())}")
+            continue
+        if not ("text" in post or "caption" in post):
+            print(f"   update_id={update['update_id']}: пост без текста/подписи, пропущен")
             continue
 
         chat = post.get("chat", {})
         chat_username = chat.get("username", "")
+        print(f"   update_id={update['update_id']}: chat_username={chat_username!r} "
+              f"(ожидаем {CHANNEL_USERNAME!r}), message_id={post.get('message_id')}")
+
         if not chat_username or chat_username.strip("@").lower() != CHANNEL_USERNAME.strip("@").lower():
             continue
 
