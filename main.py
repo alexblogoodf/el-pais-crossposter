@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import cairosvg
@@ -95,7 +96,7 @@ SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg"
 </svg>"""
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME")
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME") # Например, "@elpaisru"
 STATE_FILE = "state.json"
 
 def load_state():
@@ -107,6 +108,86 @@ def load_state():
 def save_state(post_id):
     with open(STATE_FILE, "w") as f:
         json.dump({"last_id": post_id}, f)
+
+def remove_emojis(text):
+    # Регулярное выражение для удаления эмодзи
+    emoji_pattern = re.compile(
+        r"["
+        r"\U0001F000-\U0001FAFF"  # Эмодзи и символы
+        r"\U00002700-\U000027BF"  # Денди символы
+        r"\U0001F1E6-\U0001F1FF"  # Флаги
+        r"]+", flags=re.UNICODE
+    )
+    return emoji_pattern.sub(r"", text).strip()
+
+def get_latest_post_from_channel():
+    """Получает последний пост из канала с помощью бота (бот должен быть администратором канала)"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    response = requests.get(url).json()
+    
+    # Также можно использовать getChat или просматривать сообщения канала через updates
+    # Если бот добавлен как админ, канал шлет туда посты (channel_post)
+    latest_post = None
+    max_id = 0
+    
+    if "result" in response:
+        for update in response["result"]:
+            post = update.get("channel_post")
+            if post:
+                chat = post.get("chat", {})
+                chat_username = chat.get("username", "")
+                # Проверяем, что пост именно из нашего канала
+                if chat_username and f"@{chat_username.lower()}" == CHANNEL_USERNAME.lower():
+                    post_id = post.get("message_id")
+                    if post_id > max_id:
+                        max_id = post_id
+                        latest_post = post
+                        
+    return latest_post
+
+def extract_bold_title_and_image(post):
+    """Извлекает жирный текст (заголовок) без смайликов и URL превью картинки"""
+    text = post.get("text", "")
+    entities = post.get("entities", []) or post.get("caption_entities", [])
+    
+    title_text = ""
+    
+    # Ищем текст, у которого entity == "bold"
+    for entity in entities:
+        if entity.get("type") == "bold":
+            offset = entity.get("offset")
+            length = entity.get("length")
+            raw_title = text[offset:offset+length]
+            title_text = remove_emojis(raw_title)
+            break
+            
+    # Если жирного текста нет в entities, пробуем взять первую строку или весь текст
+    if not title_text:
+        lines = text.split("\n")
+        if lines:
+            title_text = remove_emojis(lines[0])
+            
+    # Ищем превью статьи (web_page)
+    image_url = None
+    web_page = post.get("web_page")
+    if web_page:
+        # Пробуем получить большую картинку из превью
+        image_url = web_page.get("photo_url") or web_page.get("url")
+        
+    # Запасной вариант, если в посте есть обычное фото
+    if not image_url and "photo" in post:
+        photos = post.get("photo")
+        if photos:
+            # Берем самую большую фотокнопку
+            file_id = photos[-1].get("file_id")
+            # Запрашиваем путь к файлу у Telegram
+            file_info_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}"
+            file_resp = requests.get(file_info_url).json()
+            if file_resp.get("ok"):
+                file_path = file_resp["result"]["file_path"]
+                image_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+                
+    return title_text, image_url
 
 def generate_card(image_url, title_text, output_path="banner.jpg"):
     img_data = requests.get(image_url).content
@@ -193,14 +274,32 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     return output_path
 
 def main():
-    print("Запускаем тестовую генерацию карточки...")
+    print("Проверяем новые посты в канале:", CHANNEL_USERNAME)
     
-    # Тестовая картинка и заголовок
-    test_image_url = "https://picsum.photos/1200/800"
-    test_title = "ИСПАНИЯ ВВОДИТ НОВЫЕ ПРАВИЛА ДЛЯ ТУРИСТОВ И МЕСТНЫХ ЖИТЕЛЕЙ"
+    last_processed_id = load_state()
+    post = get_latest_post_from_channel()
     
-    output_file = generate_card(test_image_url, test_title, output_path="banner.jpg")
-    print(f"Карточка успешно сгенерирована и сохранена в файл: {output_file}")
+    if not post:
+        print("Новых постов в истории обновлений бота не найдено.")
+        return
+        
+    post_id = post.get("message_id")
+    if post_id <= last_processed_id:
+        print(f"Пост #{post_id} уже был обработан ранее.")
+        return
+        
+    print(, Нашли новый пост ID: {post_id})
+    title_text, image_url = extract_bold_title_and_image(post)
+    
+    print(f"Извлеченный заголовок: {title_text}")
+    print(f"Ссылка на картинку: {image_url}")
+    
+    if title_text and image_url:
+        output_file = generate_card(image_url, title_text, output_path="banner.jpg")
+        print(f"Карточка успешно сгенерирована: {output_file}")
+        save_state(post_id)
+    else:
+        print("Не удалось найти жирный текст или картинку в посте.")
 
 if __name__ == "__main__":
     main()
