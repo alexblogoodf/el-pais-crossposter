@@ -1,5 +1,4 @@
 import os
-import json
 import re
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -78,14 +77,15 @@ SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg"
 		c3.137,0,4.707-1.594,4.707-4.784v-3.936C604.591,60.955,603.021,59.359,599.884,59.359z"/>
 	<path fill="#FFFFFF" d="M639.085,92.079l-8.874-2.238c-1.853-0.514-3.075-0.849-3.666-1.003c-0.592-0.154-0.888-0.437-0.888-0.849
 		c0-0.359,0.128-0.591,0.387-0.694c0.257-0.103,0.797-0.167,1.62-0.193c0.822-0.025,2.083-0.039,3.781-0.039
-		c2.365,0,4.849,0,7.446,0s5.183,0,7.756,0l1.003-9.415c-1.595-0.359-3.55-0.656-5.864-0.888c-2.315-0.231-4.695-0.424-7.139-0.579
-		s-4.695-0.231-6.752-0.231c-4.527,0-8.091,0.451-10.688,1.351c-2.599,0.9-4.451,2.187-5.557,3.858
-		c-1.106,1.672-1.659,3.692-1.659,6.058c0,2.006,0.257,3.808,0.771,5.402c0.514,1.595,1.492,2.997,2.933,4.205
-		c1.439,1.21,3.575,2.227,6.405,3.049l8.488,2.314c2.007,0.566,3.344,0.939,4.013,1.119c0.668,0.181,1.004,0.502,1.004,0.965
-		c0,0.36-0.182,0.63-0.541,0.81c-0.36,0.182-1.132,0.284-2.314,0.31c-1.185,0.026-3.01,0.038-5.479,0.038c-1.801,0-3.64,0-5.518,0
-		s-3.55,0-5.016,0s-2.534,0-3.202,0l-1.004,9.415c4.27,0.721,8.219,1.169,11.846,1.350c3.627,0.18,6.366,0.271,8.219,0.271
-		c4.476,0,8.089-0.386,10.842-1.157c2.752-0.772,4.746-2.084,5.98-3.936c1.235-1.853,1.853-4.399,1.853-7.64
-		c0-3.344-0.837-5.877-2.508-7.602C645.091,94.408,642.531,93.057,639.085,92.079z"/>
+		c2.365,0,4.849,0,7.446,0s5.183,0,7.756,0l1.003-9.415c-1.595-0.359-3.55-0.656-5.864-0.888
+		c-2.315-0.231-4.695-0.424-7.139-0.579s-4.695-0.231-6.752-0.231c-4.527,0-8.091,0.451-10.688,1.351
+		c-2.599,0.9-4.451,2.187-5.557,3.858c-1.106,1.672-1.659,3.692-1.659,6.058c0,2.006,0.257,3.808,0.771,5.402
+		c0.514,1.595,1.492,2.997,2.933,4.205c1.439,1.21,3.575,2.227,6.405,3.049l8.488,2.314c2.007,0.566,3.344,0.939,4.013,1.119
+		c0.668,0.181,1.004,0.502,1.004,0.965c0,0.36-0.182,0.63-0.541,0.81c-0.36,0.182-1.132,0.284-2.314,0.31
+		c-1.185,0.026-3.01,0.038-5.479,0.038c-1.801,0-3.64,0-5.518,0s-3.55,0-5.016,0s-2.534,0-3.202,0l-1.004,9.415
+		c4.27,0.721,8.219,1.169,11.846,1.350c3.627,0.18,6.366,0.271,8.219,0.271c4.476,0,8.089-0.386,10.842-1.157
+		c2.752-0.772,4.746-2.084,5.98-3.936c1.235-1.853,1.853-4.399,1.853-7.64c0-3.344-0.837-5.877-2.508-7.602
+		C645.091,94.408,642.531,93.057,639.085,92.079z"/>
 	<path fill="#FFFFFF" d="M675.508,77.726c-2.496,1.105-4.924,2.753-7.285,4.931l-1.434-5.626h-12.655v38.585h16.205V91.577
 		c2.006-0.308,3.699-0.516,5.055-0.617c1.723-0.128,3.279-0.193,4.669-0.193h4.09l1.389-14.816h-2.238
 		C680.781,75.951,678.183,76.543,675.508,77.726z"/>
@@ -96,35 +96,14 @@ SVG_LOGO = """<svg version="1.1" id="Layer_1" xmlns="http://www.w3.org/2000/svg"
 </svg>"""
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME") # Например, "@elpaisru"
-STATE_FILE = "state.json"
-
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            try:
-                data = json.load(f)
-                val = data.get("last_id", 0)
-                # Если в стейте строка вида "elpaisru/56", вытаскиваем из неё только цифры
-                if isinstance(val, str):
-                    numbers = re.findall(r'\d+', val)
-                    return int(numbers[-1]) if numbers else 0
-                return int(val)
-            except (ValueError, TypeError):
-                return 0
-    return 0
-
-def save_state(post_id):
-    with open(STATE_FILE, "w") as f:
-        json.dump({"last_id": post_id}, f)
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME")
 
 def remove_emojis(text):
-    # Регулярное выражение для удаления эмодзи
     emoji_pattern = re.compile(
         r"["
-        r"\U0001F000-\U0001FAFF"  # Эмодзи и символы
-        r"\U00002700-\U000027BF"  # Денди символы
-        r"\U0001F1E6-\U0001F1FF"  # Флаги
+        r"\U0001F000-\U0001FAFF"
+        r"\U00002700-\U000027BF"
+        r"\U0001F1E6-\U0001F1FF"
         r"]+", flags=re.UNICODE
     )
     return emoji_pattern.sub(r"", text).strip()
@@ -138,15 +117,12 @@ def get_latest_post_from_channel():
     
     if "result" in response:
         for update in response["result"]:
-            # Берем только посты канала, у которых есть текст или подпись (исключаем системные уведомления о закреплении)
             post = update.get("channel_post")
             if post and ("text" in post or "caption" in post):
                 chat = post.get("chat", {})
                 chat_username = chat.get("username", "")
-                
                 if chat_username and f"@{chat_username.lower()}" == CHANNEL_USERNAME.lower():
                     post_id = post.get("message_id")
-                    # Ищем пост с самым большим ID (самый свежий)
                     if post_id > max_id:
                         max_id = post_id
                         latest_post = post
@@ -154,13 +130,10 @@ def get_latest_post_from_channel():
     return latest_post
 
 def extract_bold_title_and_image(post):
-    """Извлекает жирный текст (заголовок) без смайликов и URL превью картинки"""
-    text = post.get("text", "")
+    text = post.get("text", "") or post.get("caption", "")
     entities = post.get("entities", []) or post.get("caption_entities", [])
     
     title_text = ""
-    
-    # Ищем текст, у которого entity == "bold"
     for entity in entities:
         if entity.get("type") == "bold":
             offset = entity.get("offset")
@@ -169,26 +142,20 @@ def extract_bold_title_and_image(post):
             title_text = remove_emojis(raw_title)
             break
             
-    # Если жирного текста нет в entities, пробуем взять первую строку или весь текст
     if not title_text:
         lines = text.split("\n")
         if lines:
             title_text = remove_emojis(lines[0])
             
-    # Ищем превью статьи (web_page)
     image_url = None
     web_page = post.get("web_page")
     if web_page:
-        # Пробуем получить большую картинку из превью
         image_url = web_page.get("photo_url") or web_page.get("url")
         
-    # Запасной вариант, если в посте есть обычное фото
     if not image_url and "photo" in post:
         photos = post.get("photo")
         if photos:
-            # Берем самую большую фотокнопку
             file_id = photos[-1].get("file_id")
-            # Запрашиваем путь к файлу у Telegram
             file_info_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}"
             file_resp = requests.get(file_info_url).json()
             if file_resp.get("ok"):
@@ -198,14 +165,16 @@ def extract_bold_title_and_image(post):
     return title_text, image_url
 
 def generate_card(image_url, title_text, output_path="banner.jpg"):
-    img_data = requests.get(image_url).content
-    with open("temp_src.jpg", "wb") as f:
-        f.write(img_data)
+    # Если в посте нет картинки/превью, можно подставить дефолтную или создать пустой фон
+    if not image_url:
+        img = Image.new("RGBA", (1080, 1080), (30, 30, 30, 255))
+    else:
+        img_data = requests.get(image_url).content
+        with open("temp_src.jpg", "wb") as f:
+            f.write(img_data)
+        img = Image.open("temp_src.jpg").convert("RGBA")
         
-    img = Image.open("temp_src.jpg").convert("RGBA")
     width, height = img.size
-    
-    # Квадратный кроп строго от центра
     min_side = min(width, height)
     left = (width - min_side) / 2
     top = (height - min_side) / 2
@@ -215,7 +184,6 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     img = img.crop((left, top, right, bottom))
     img = img.resize((1080, 1080), Image.Resampling.LANCZOS)
     
-    # Черный фон с прозрачностью 40% (alpha = 102)
     overlay = Image.new("RGBA", (1080, 1080), (0, 0, 0, 102))
     img = Image.alpha_composite(img, overlay)
     
@@ -249,7 +217,6 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     total_height = len(lines) * line_height
     start_y = (1080 - total_height) / 2
     
-    # Создаем тень (Drop Shadow: 75% черный, блюр 30 pt)
     shadow_layer = Image.new("RGBA", (1080, 1080), (0, 0, 0, 0))
     shadow_draw = ImageDraw.Draw(shadow_layer)
     
@@ -263,7 +230,6 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(30))
     img = Image.alpha_composite(img, shadow_layer)
     
-    # Рисуем белый текст поверх тени
     draw_final = ImageDraw.Draw(img)
     for i, line in enumerate(lines):
         bbox = draw_final.textbbox((0, 0), line, font=font)
@@ -272,7 +238,6 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
         y = start_y + (i * line_height)
         draw_final.text((x, y), line, font=font, fill=(255, 255, 255, 255))
         
-    # Накладываем логотип из SVG в левый верхний угол
     cairosvg.svg2png(bytestring=SVG_LOGO.encode('utf-8'), write_to="logo_temp.png", output_width=320)
     logo = Image.open("logo_temp.png").convert("RGBA")
     img.paste(logo, (60, 60), logo)
@@ -282,24 +247,23 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
     return output_path
 
 def main():
-    print(f"Проверяем последние посты в канале: {CHANNEL_USERNAME}")
-    
-    # 1. Получаем самый свежий текстовый пост из канала
+    print(f"Проверяем канал: {CHANNEL_USERNAME}")
     latest_post = get_latest_post_from_channel()
     
     if not latest_post:
-        print("❌ Не найдено подходящих текстовых постов в последних обновлениях бота.")
+        print("❌ Не найдено постов для обработки.")
         return
-
+        
     post_id = latest_post.get("message_id")
-    text = latest_post.get("text") or latest_post.get("caption", "")
-    print(f"✅ Успешно взят последний пост ID: {post_id}")
-
-    # 2. Обрабатываем текст, находим картинку/превью и генерируем banner.jpg
-    # (здесь вызываются ваши функции парсинга и генерации изображения через Pillow)
-    # Пример: generate_banner(text, image_url, output_path="banner.jpg")
+    print(f"✅ Взят последний пост ID: {post_id}")
     
-    print("🎨 Картинка banner.jpg успешно сгенерирована и сохранена в корень проекта.")
+    title_text, image_url = extract_bold_title_and_image(latest_post)
+    print(f"Заголовок: {title_text}")
+    print(f"Картинка: {image_url}")
+    
+    # Генерируем картинку независимо от того, был ли пост обработан ранее
+    generate_card(image_url, title_text, output_path="banner.jpg")
+    print("🎨 Картинка banner.jpg успешно создана!")
 
 if __name__ == "__main__":
     main()
