@@ -109,8 +109,12 @@ def remove_emojis(text):
     return emoji_pattern.sub(r"", text).strip()
 
 def get_latest_post_from_channel():
-    # Передаем offset=-1 или выгребаем всё и ищем реально последний по message_id
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?allowed_updates=[\"channel_post\"]"
+    # Сначала делаем пустой запрос с offset=-1 и limit=1, чтобы «сдвинуть» очередь Telegram
+    url_clear = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset=-1"
+    resp = requests.get(url_clear).json()
+    
+    # Теперь запрашиваем актуальные апдейты
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     response = requests.get(url).json()
     
     latest_post = None
@@ -122,9 +126,10 @@ def get_latest_post_from_channel():
             if post and ("text" in post or "caption" in post):
                 chat = post.get("chat", {})
                 chat_username = chat.get("username", "")
-                if chat_username and f"@{chat_username.lower()}" == CHANNEL_USERNAME.lower():
+                
+                # Сравниваем имя канала (убираем лишние пробелы и `@`)
+                if chat_username and chat_username.strip("@").lower() == CHANNEL_USERNAME.strip("@").lower():
                     text = post.get("text", "") or post.get("caption", "")
-                    # Игнорируем системные фразы приветствия, если они проскакивают
                     if "добро пожаловать" in text.lower():
                         continue
                         
