@@ -146,6 +146,7 @@ def get_all_posts_from_rss_bridge():
         if not link:
             continue
         title_raw = ""
+        hashtags = []
         text_div = item.find('div', class_='tgme_widget_message_text')
         if text_div:
             for b in text_div.find_all('b'):
@@ -153,27 +154,68 @@ def get_all_posts_from_rss_bridge():
                 if remove_emojis(raw):
                     title_raw = raw
                     break
+            for a in text_div.find_all('a'):
+                t = a.get_text().strip()
+                if t.startswith('#') and t not in hashtags:
+                    hashtags.append(t)
+
         image_url = None
         blockquote = item.find('blockquote')
         if blockquote:
             img_tag = blockquote.find('img')
             if img_tag and img_tag.get('src'):
                 image_url = img_tag.get('src')
+
         posts.append({
             "link": link,
             "title_raw": title_raw or "Новость ЭльПаис",
             "title_clean": remove_emojis(title_raw) or "Новость ЭльПаис",
             "image_url": image_url,
+            "hashtags": hashtags,
         })
     return posts
 
-def build_tweet_text(title_raw, link):
+def tweet_len(text):
+    """Примерный подсчёт символов по правилам Twitter: эмодзи/широкие символы = 2, остальные = 1."""
+    n = 0
+    for ch in text:
+        o = ord(ch)
+        if o >= 0x1000 or 0x2600 <= o <= 0x27BF or 0x2B00 <= o <= 0x2BFF or 0xFE00 <= o <= 0xFE0F:
+            n += 2
+        else:
+            n += 1
+    return n
+
+def build_tweet_text(title_raw, link, hashtags=None):
+    mandatory = ["#новости", "#эльпаис"]
+    tags = []
+    for t in (hashtags or []) + mandatory:
+        t = t.strip()
+        if t and t.lower() not in {x.lower() for x in tags}:
+            tags.append(t)
+
     suffix = "\n\nЧитать в телеграм 👉 "
-    max_title = 280 - len(suffix) - len(link)
+
+    # Если твит слишком длинный — отбрасываем хештеги поста (обязательные остаются)
+    while len(tags) > len(mandatory):
+        tags_line = "\n\n" + " ".join(tags)
+        if tweet_len(suffix) + 23 + tweet_len(tags_line) + 30 <= 280:
+            break
+        for i in range(len(tags) - 1, -1, -1):
+            if tags[i].lower() not in {m.lower() for m in mandatory}:
+                tags.pop(i)
+                break
+        else:
+            break
+
+    tags_line = "\n\n" + " ".join(tags)
+    available = 280 - tweet_len(suffix) - 23 - tweet_len(tags_line)
     title = title_raw.strip()
-    if len(title) > max_title:
-        title = title[:max_title - 1].rstrip() + "…"
-    return f"{title}{suffix}{link}"
+    if tweet_len(title) > available:
+        while title and tweet_len(title) > available - 1:
+            title = title[:-1]
+        title = title.rstrip() + "…"
+    return f"{title}{suffix}{link}{tags_line}"
 
 # ---------- ГЕНЕРАЦИЯ КАРТИНКИ (без изменений) ----------
 def generate_card(image_url, title_text, output_path="banner.jpg"):
@@ -342,9 +384,10 @@ def cmd_generate():
         os.makedirs("banners", exist_ok=True)
         img_name = f"banners/{post_id}.jpg"
         generate_card(to_post["image_url"], to_post["title_clean"], output_path=img_name)
-        with open(PENDING_FILE, "w", encoding="utf-8") as f:
+                with open(PENDING_FILE, "w", encoding="utf-8") as f:
             json.dump({"link": to_post["link"],
-                       "text": build_tweet_text(to_post["title_raw"], to_post["link"]),
+                       "text": build_tweet_text(to_post["title_raw"], to_post["link"],
+                                                to_post.get("hashtags", [])),
                        "image": img_name}, f, ensure_ascii=False, indent=2)
         print(f"📦 Подготовлен твит: {to_post['link']}")
     else:
