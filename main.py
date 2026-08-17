@@ -374,8 +374,14 @@ def cmd_post():
     except Exception as e:
         ok, info = False, str(e)
 
-    if ok:
-        print(f"✅ Твит опубликован через Buffer, id: {info}")
+    # Если Buffer говорит, что пост уже опубликован — считаем это успехом
+    already_posted = "already got this one scheduled" in str(info) or "same thing twice" in str(info)
+
+    if ok or already_posted:
+        if already_posted:
+            print(f"⚠️ Этот пост уже был опубликован ранее в Buffer. Помечаем как обработанный.")
+        else:
+            print(f"✅ Твит опубликован через Buffer, id: {info}")
         history = load_history()
         processed = set(history.get("processed", []))
         processed.add(pending["link"])
@@ -384,7 +390,6 @@ def cmd_post():
         os.remove(PENDING_FILE)
     else:
         print(f"❌ Buffer не опубликовал: {info}. Повторим в следующем запуске.")
-
 
 if __name__ == "__main__":
     command = sys.argv[1] if len(sys.argv) > 1 else "generate"
