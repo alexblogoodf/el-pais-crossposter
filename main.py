@@ -74,12 +74,25 @@ def get_all_posts_from_rss_bridge(cache_counter):
                     hashtags.append(t)
 
         image_url = None
+        # 1. Сначала ищем картинку в <blockquote> (старый формат)
         blockquote = item.find('blockquote')
         if blockquote:
             img_tag = blockquote.find('img')
             if img_tag and img_tag.get('src'):
                 image_url = img_tag.get('src')
 
+        # 2. Если не нашли — ищем картинку прямо в item-content перед текстом поста (новый формат)
+        if not image_url:
+            content_div = item.find('div', class_='item-content')
+            if content_div:
+                text_div = content_div.find('div', class_='tgme_widget_message_text')
+                # Берём первый <img>, который НЕ внутри текста поста
+                for img in content_div.find_all('img'):
+                    if text_div and img.find_parent('div', class_='tgme_widget_message_text'):
+                        continue
+                    if img.get('src'):
+                        image_url = img.get('src')
+                        break
         posts.append({
             "link": link,
             "title_raw": title_raw or "Новость ЭльПаис",
