@@ -8,13 +8,13 @@ from bs4 import BeautifulSoup
 BRIDGE_URL = "https://rss-bridge.org/bridge01/?action=display&username=elpaisru&bridge=TelegramBridge&format=Html"
 BUFFER_API = "https://api.buffer.com"
 
-HISTORY_FILE = "instagram_posted_history.json"   # отдельная история, НЕ трогает твиттер
+HISTORY_FILE = "instagram_posted_history.json"
 BANNERS_DIR  = "banners"
 
-START_FROM_ID = 105          # 👈 начинаем с 105.jpg, всё что ниже — игнорируем
-MAX_CAPTION   = 2100         # лимит подписи Instagram (~2200), берём с запасом
+START_FROM_ID = 105          # 👈 начинаем с 105.jpg
+MAX_CAPTION   = 2100
+MAX_RETRIES   = 5            # сколько запусков пробовать, прежде чем пометить пост пропущенным
 
-# хештеги-заполнители, если в новости своих меньше 5
 DEFAULT_TAGS = ["#новости", "#эльпаис", "#Испания", "#ElPais", "#España"]
 # =================================================
 
@@ -27,7 +27,7 @@ def load_history():
                 return json.load(f)
         except Exception as e:
             print(f"⚠️ Не удалось прочитать историю: {e}")
-    return {"posted": [], "cache_counter": 1}
+    return {"posted": [], "cache_counter": 1, "retry_counts": {}}
 
 
 def save_history(h):
@@ -37,7 +37,6 @@ def save_history(h):
 
 # ---------- Поиск готовых баннеров ----------
 def get_available_banner_ids():
-    """Возвращает список номеров всех баннеров в папке banners/"""
     if not os.path.isdir(BANNERS_DIR):
         print(f"❌ Папка {BANNERS_DIR} не найдена.")
         return []
@@ -50,6 +49,11 @@ def get_available_banner_ids():
 
 
 # ---------- RSS: получаем текст новости по номеру ----------
+def extract_post_id(link):
+    """Извлекает номер поста из ссылки тем же способом, что и main-9.py"""
+    return link.rstrip("/").split("/")[-1].split("?")[0].split("#")[0]
+
+
 def fetch_news_by_id(target_id, cache_counter):
     bridge_url = f"{BRIDGE_URL}&_cache_timeout={cache_counter}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -65,35 +69,46 @@ def fetch_news_by_id(target_id, cache_counter):
     if not items:
         items = soup.find_all('div', class_='item') or soup.find_all('article')
 
+    print(f"🔍 Постов в RSS-ленте: {len(items)}")
+
+    # Отладка: выводим все номера, которые видим в ленте
+    all_ids = []
     for item in items:
         link_tag = item.find('a', class_='itemtitle')
         link = link_tag.get('href') if link_tag else None
         if not link:
             continue
-        m = re.search(r'/(\d+)', link)
-        if not m or int(m.group(1)) != target_id:
+        all_ids.append(extract_post_id(link))
+    print(f"🔍 Номера в ленте: {', '.join(all_ids[:40])}")
+    print(f"🎯 Ищем номер: {target_id}")
+
+    for item in items:
+        link_tag = item.find('a', class_='itemtitle')
+        link = link_tag.get('href') if link_tag else None
+        if not link:
             continue
-        return parse_news_item(item, link)   # нашли новость с нужным номером
+        pid = extract_post_id(link)
+        try:
+            if int(pid) == target_id:
+                return parse_news_item(item, link)
+        except ValueError:
+            continue
     return None
 
 
 def parse_news_item(item, link):
-    """Достаёт заголовок, хештеги и полный текст поста"""
     text_div = item.find('div', class_='tgme_widget_message_text')
     title, hashtags, full_text = "", [], ""
     if text_div:
-        # заголовок = первый <b>
         for b in text_div.find_all('b'):
             t = b.get_text().strip()
             if t:
                 title = t
                 break
-        # хештеги = все <a>, начинающиеся с #
         for a in text_div.find_all('a'):
             t = a.get_text().strip()
             if t.startswith('#') and t not in hashtags:
                 hashtags.append(t)
-        # полный текст с переносами строк
         for br in text_div.find_all('br'):
             br.replace_with('\n')
         full_text = text_div.get_text()
@@ -115,7 +130,6 @@ def build_caption(news):
     hashtags = news["hashtags"]
     body     = news["full_text"]
 
-    # Чистим тело: убираем хештеги, ссылки t.me и строки "читать в телеграм"
     for h in hashtags:
         body = body.replace(h, '')
     body = re.sub(r'https?://t\.me/\S+', '', body)
@@ -128,12 +142,10 @@ def build_caption(news):
         lines.append(s)
     body = '\n'.join(lines)
 
-    # убираем заголовок из начала тела, чтобы не дублировать
     if title and body.strip().startswith(title):
         body = body.strip()[len(title):].strip()
     body = re.sub(r'\n{3,}', '\n\n', body).strip()
 
-    # ровно 5 хештегов: свои из новости + заполнители
     tags = []
     for h in hashtags:
         if len(tags) >= 5:
@@ -149,7 +161,6 @@ def build_caption(news):
 
     link_line = f"Читать в телеграм 👉 {news['link']}"
 
-    # обрезаем тело, если подпись вылезает за лимит
     fixed = len(title) + len(tags_line) + len(link_line) + 6
     avail = MAX_CAPTION - fixed
     if len(body) > avail:
@@ -233,8 +244,8 @@ def main():
 
     history    = load_history()
     posted_ids = set(history.get("posted", []))
+    retries    = history.get("retry_counts", {})
 
-    # ищем готовые баннеры, которые ещё не постили и номер >= START_FROM_ID
     available  = get_available_banner_ids()
     candidates = sorted([b for b in available
                          if b >= START_FROM_ID and str(b) not in posted_ids])
@@ -243,19 +254,27 @@ def main():
         print("😴 Свободных готовых баннеров нет. Ждём следующую новость.")
         return
 
-    target_id   = candidates[0]                 # одна новость за запуск — самая ранняя
+    target_id   = candidates[0]
     banner_path = f"{BANNERS_DIR}/{target_id}.jpg"
     print(f"🎯 Публикуем баннер: {banner_path}")
 
-    # подтягиваем текст новости по номеру
     cache_counter = history.get("cache_counter", 1)
     news = fetch_news_by_id(target_id, cache_counter)
     history["cache_counter"] = cache_counter + 1
 
     if not news:
-        print(f"⚠️ Новость ID {target_id} не найдена в RSS. Помечаем пропущенной, чтобы не зациклиться.")
-        posted_ids.add(str(target_id))
-        history["posted"] = sorted(posted_ids)[-500:]
+        count = retries.get(str(target_id), 0) + 1
+        retries[str(target_id)] = count
+        history["retry_counts"] = retries
+
+        if count >= MAX_RETRIES:
+            print(f"⚠️ Новость ID {target_id} не найдена после {count} попыток. Помечаем пропущенной.")
+            posted_ids.add(str(target_id))
+            history["posted"] = sorted(posted_ids)[-500:]
+            retries.pop(str(target_id), None)
+            history["retry_counts"] = retries
+        else:
+            print(f"⚠️ Новость ID {target_id} не найдена в RSS (попытка {count}/{MAX_RETRIES}). Попробуем в следующем запуске.")
         save_history(history)
         return
 
@@ -282,6 +301,8 @@ def main():
             print(f"✅ Пост принят Buffer, id: {info}")
         posted_ids.add(str(target_id))
         history["posted"] = sorted(posted_ids)[-500:]
+        retries.pop(str(target_id), None)
+        history["retry_counts"] = retries
         save_history(history)
         print("💾 История обновлена.")
     else:
