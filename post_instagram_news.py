@@ -83,7 +83,7 @@ def fetch_all_rss_news(cache_counter):
     soup = BeautifulSoup(r.text, 'html.parser')
     items = soup.find_all('section', class_='feeditem')
     if not items:
-        items = soup.find_all('div', class_='item') or soup.find.find_all('article')
+        items = soup.find_all('div', class_='item') or soup.find_all('article')
 
     news_dict = {}
     for item in items:
@@ -123,14 +123,25 @@ def build_caption(news):
     hashtags = news["hashtags"]
     body     = news["full_text"]
 
+    # Убираем хештеги из тела
     for h in hashtags:
         body = body.replace(h, '')
+    
+    # Убираем ссылки на телеграм и elpais.com
     body = re.sub(r'https?://t\.me/\S+', '', body)
+    body = re.sub(r'https?://elpais\.com/\S+', '', body)
     body = re.sub(r'(?<!\w)t\.me/\S+', '', body)
+    
+    # Фильтруем строки
     lines = []
     for line in body.split('\n'):
         s = line.strip()
-        if 'читать в телеграм' in s.lower():
+        # Пропускаем строки с "читать в телеграм" или "читать оригинал"
+        s_lower = s.lower()
+        if 'читать в телеграм' in s_lower or 'читать оригинал' in s_lower:
+            continue
+        # Пропускаем строки, которые содержат только эмодзи (например, 🔗)
+        if not s or re.match(r'^[\U0001F000-\U0001FFFF\U00002600-\U000027BF\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002702-\U000027B0\U000024C2-\U0001F251\U0001F300-\U0001F5FF\U0001F600-\U0001F64F\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]+$', s):
             continue
         lines.append(s)
     body = '\n'.join(lines)
@@ -236,7 +247,7 @@ def main():
         return
 
     history    = load_history()
-    posted_ids = set(history.get("posted", []))  # строки в истории — это строки ID
+    posted_ids = set(history.get("posted", []))
 
     # 1. Получаем все новости из RSS (ключи — INT)
     cache_counter = history.get("cache_counter", 1)
@@ -248,7 +259,7 @@ def main():
         save_history(history)
         return
 
-    rss_ids = set(rss_news.keys())  # множество INT
+    rss_ids = set(rss_news.keys())
     print(f"📋 Доступно в RSS (int): {sorted(rss_ids)}")
 
     # 2. Получаем все готовые баннеры (INT)
