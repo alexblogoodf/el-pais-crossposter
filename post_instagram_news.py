@@ -34,7 +34,12 @@ def save_history(h):
 
 # ---------- Парсинг RSS ----------
 def extract_post_id(link):
-    return link.rstrip("/").split("/")[-1].split("?")[0].split("#")[0]
+    """Извлекает номер поста из ссылки: https://t.me/elpaisru/107 -> 107 (как int)"""
+    raw = link.rstrip("/").split("/")[-1].split("?")[0].split("#")[0]
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def parse_text_div(text_div, link):
@@ -65,7 +70,7 @@ def parse_text_div(text_div, link):
 
 
 def fetch_all_rss_news(cache_counter):
-    """Возвращает словарь {ID: {title, hashtags, full_text, link}} всех постов из RSS"""
+    """Возвращает словарь {int_ID: {title, hashtags, full_text, link}} всех постов из RSS"""
     bridge_url = f"{BRIDGE_URL}&_cache_timeout={cache_counter}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
@@ -78,7 +83,7 @@ def fetch_all_rss_news(cache_counter):
     soup = BeautifulSoup(r.text, 'html.parser')
     items = soup.find_all('section', class_='feeditem')
     if not items:
-        items = soup.find_all('div', class_='item') or soup.find_all('article')
+        items = soup.find_all('div', class_='item') or soup.find.find_all('article')
 
     news_dict = {}
     for item in items:
@@ -87,18 +92,20 @@ def fetch_all_rss_news(cache_counter):
         if not link:
             continue
         pid = extract_post_id(link)
+        if pid is None:
+            continue
         text_div = item.find('div', class_='tgme_widget_message_text')
         news_dict[pid] = parse_text_div(text_div, link)
 
     print(f"🔍 Постов в RSS-ленте: {len(news_dict)}")
     if news_dict:
-        ids = sorted([int(k) for k in news_dict.keys()])
-        print(f"🔍 Номера в ленте: {', '.join(map(str, ids[:40]))}")
+        ids = sorted(news_dict.keys())
+        print(f"🔍 Номера в ленте (int): {ids[:40]}")
     return news_dict
 
 
 def get_available_banner_ids():
-    """Возвращает список номеров баннеров из папки banners/"""
+    """Возвращает список int-номеров баннеров из папки banners/"""
     if not os.path.isdir(BANNERS_DIR):
         print(f"❌ Папка {BANNERS_DIR} не найдена.")
         return []
@@ -107,7 +114,7 @@ def get_available_banner_ids():
         m = re.match(r'^(\d+)\.(jpg|jpeg|png)$', f, re.IGNORECASE)
         if m:
             ids.append(int(m.group(1)))
-    return ids
+    return sorted(ids)
 
 
 # ---------- Сборка подписи ----------
@@ -116,7 +123,6 @@ def build_caption(news):
     hashtags = news["hashtags"]
     body     = news["full_text"]
 
-    # Чистим тело от хештегов и ссылок на телеграм
     for h in hashtags:
         body = body.replace(h, '')
     body = re.sub(r'https?://t\.me/\S+', '', body)
@@ -129,12 +135,10 @@ def build_caption(news):
         lines.append(s)
     body = '\n'.join(lines)
 
-    # Убираем заголовок из начала, если он там есть
     if title and body.strip().startswith(title):
         body = body.strip()[len(title):].strip()
     body = re.sub(r'\n{3,}', '\n\n', body).strip()
 
-    # Собираем ровно 5 хештегов
     tags = []
     for h in hashtags:
         if len(tags) >= 5:
@@ -150,7 +154,6 @@ def build_caption(news):
 
     link_line = f"Читать в телеграм 👉 {news['link']}"
 
-    # Обрезаем тело под лимит Instagram
     fixed = len(title) + len(tags_line) + len(link_line) + 6
     avail = MAX_CAPTION - fixed
     if len(body) > avail:
@@ -233,9 +236,9 @@ def main():
         return
 
     history    = load_history()
-    posted_ids = set(history.get("posted", []))
+    posted_ids = set(history.get("posted", []))  # строки в истории — это строки ID
 
-    # 1. Получаем все новости из RSS
+    # 1. Получаем все новости из RSS (ключи — INT)
     cache_counter = history.get("cache_counter", 1)
     rss_news = fetch_all_rss_news(cache_counter)
     history["cache_counter"] = cache_counter + 1
@@ -245,18 +248,27 @@ def main():
         save_history(history)
         return
 
-    rss_ids = set(rss_news.keys())
-    print(f"📋 Доступно в RSS: {len(rss_ids)} постов")
+    rss_ids = set(rss_news.keys())  # множество INT
+    print(f"📋 Доступно в RSS (int): {sorted(rss_ids)}")
 
-    # 2. Получаем все готовые баннеры
+    # 2. Получаем все готовые баннеры (INT)
     banner_ids = set(get_available_banner_ids())
-    print(f"🖼 Доступно баннеров: {len(banner_ids)}")
+    print(f"🖼 Доступно баннеров (int): {sorted(banner_ids)}")
 
-    # 3. Находим пересечение: баннер И текст в RSS, и НЕ запощено
-    candidates = sorted([
-        int(pid) for pid in (rss_ids & banner_ids)
-        if pid not in posted_ids
-    ])
+    # 3. Приводим posted_ids к INT для корректного сравнения
+    posted_int_ids = set()
+    for pid in posted_ids:
+        try:
+            posted_int_ids.add(int(pid))
+        except ValueError:
+            pass
+
+    # 4. Находим пересечение: (есть в RSS) И (есть баннер) И (не запощено)
+    candidates = sorted(list((rss_ids & banner_ids) - posted_int_ids))
+
+    print(f"📊 Пересечение (RSS ∩ баннеры): {sorted(rss_ids & banner_ids)}")
+    print(f"📊 Уже запощено: {sorted(posted_int_ids)}")
+    print(f"🎯 Кандидаты к публикации: {candidates}")
 
     if not candidates:
         print("😴 Нет свободных баннеров с актуальным текстом в RSS. Ждём.")
@@ -267,21 +279,19 @@ def main():
     target_id = candidates[0]
     target_str = str(target_id)
     banner_path = f"{BANNERS_DIR}/{target_str}.jpg"
-    news = rss_news[target_str]
+    news = rss_news[target_id]
 
-    print(f"🎯 Публикуем баннер: {banner_path}")
+    print(f"\n🎯 Публикуем баннер: {banner_path}")
     print(f"📝 Заголовок: {news['title']}")
 
     caption = build_caption(news)
     print(f"📝 Подпись:\n{caption}\n")
 
-    # Ссылка на картинку на GitHub (raw)
     repo   = os.environ.get("GITHUB_REPOSITORY", "")
     branch = os.environ.get("GITHUB_REF_NAME", "main")
     image_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{banner_path}"
     print(f"🖼 Картинка: {image_url}")
 
-    # Отправка в Buffer
     try:
         channel_id = get_instagram_channel_id(token)
         ok, info = buffer_create_instagram_post(token, channel_id, caption, image_url)
