@@ -7,13 +7,14 @@ from bs4 import BeautifulSoup
 # ================== НАСТРОЙКИ ==================
 BRIDGE_URL = "https://rss-bridge.org/bridge01/?action=display&username=elpaisru&bridge=TelegramBridge&format=Html"
 BUFFER_API = "https://api.buffer.com"
+CHANNEL_HANDLE = "elpaisru"          # ник телеграм-канала для прямых ссылок
 
 HISTORY_FILE = "instagram_posted_history.json"
 BANNERS_DIR  = "banners"
 
 START_FROM_ID = 105          # 👈 начинаем с 105.jpg
 MAX_CAPTION   = 2100
-MAX_RETRIES   = 5            # сколько запусков пробовать, прежде чем пометить пост пропущенным
+MAX_RETRIES   = 5            # попыток, прежде чем пометить пост пропущенным
 
 DEFAULT_TAGS = ["#новости", "#эльпаис", "#Испания", "#ElPais", "#España"]
 # =================================================
@@ -48,56 +49,13 @@ def get_available_banner_ids():
     return ids
 
 
-# ---------- RSS: получаем текст новости по номеру ----------
+# ---------- Извлечение номера поста из ссылки ----------
 def extract_post_id(link):
-    """Извлекает номер поста из ссылки тем же способом, что и main-9.py"""
     return link.rstrip("/").split("/")[-1].split("?")[0].split("#")[0]
 
 
-def fetch_news_by_id(target_id, cache_counter):
-    bridge_url = f"{BRIDGE_URL}&_cache_timeout={cache_counter}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    try:
-        r = requests.get(bridge_url, headers=headers, timeout=15)
-        r.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Ошибка доступа к RSS-Bridge: {e}")
-        return None
-
-    soup = BeautifulSoup(r.text, 'html.parser')
-    items = soup.find_all('section', class_='feeditem')
-    if not items:
-        items = soup.find_all('div', class_='item') or soup.find_all('article')
-
-    print(f"🔍 Постов в RSS-ленте: {len(items)}")
-
-    # Отладка: выводим все номера, которые видим в ленте
-    all_ids = []
-    for item in items:
-        link_tag = item.find('a', class_='itemtitle')
-        link = link_tag.get('href') if link_tag else None
-        if not link:
-            continue
-        all_ids.append(extract_post_id(link))
-    print(f"🔍 Номера в ленте: {', '.join(all_ids[:40])}")
-    print(f"🎯 Ищем номер: {target_id}")
-
-    for item in items:
-        link_tag = item.find('a', class_='itemtitle')
-        link = link_tag.get('href') if link_tag else None
-        if not link:
-            continue
-        pid = extract_post_id(link)
-        try:
-            if int(pid) == target_id:
-                return parse_news_item(item, link)
-        except ValueError:
-            continue
-    return None
-
-
-def parse_news_item(item, link):
-    text_div = item.find('div', class_='tgme_widget_message_text')
+# ---------- Парсинг текста из блока tgme_widget_message_text ----------
+def parse_text_div(text_div, link):
     title, hashtags, full_text = "", [], ""
     if text_div:
         for b in text_div.find_all('b'):
@@ -122,6 +80,76 @@ def parse_news_item(item, link):
         "hashtags": hashtags,
         "full_text": full_text,
     }
+
+
+def parse_news_item(item, link):
+    """Для поста, пришедшего из RSS-Bridge"""
+    text_div = item.find('div', class_='tgme_widget_message_text')
+    return parse_text_div(text_div, link)
+
+
+# ---------- RSS: ищем пост в последних 20 ----------
+def fetch_news_by_id(target_id, cache_counter):
+    bridge_url = f"{BRIDGE_URL}&_cache_timeout={cache_counter}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        r = requests.get(bridge_url, headers=headers, timeout=15)
+        r.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Ошибка доступа к RSS-Bridge: {e}")
+        return None
+
+    soup = BeautifulSoup(r.text, 'html.parser')
+    items = soup.find_all('section', class_='feeditem')
+    if not items:
+        items = soup.find_all('div', class_='item') or soup.find_all('article')
+
+    print(f"🔍 Постов в RSS-ленте: {len(items)}")
+
+    all_ids = []
+    for item in items:
+        link_tag = item.find('a', class_='itemtitle')
+        link = link_tag.get('href') if link_tag else None
+        if not link:
+            continue
+        all_ids.append(extract_post_id(link))
+    print(f"🔍 Номера в ленте: {', '.join(all_ids[:40])}")
+    print(f"🎯 Ищем номер: {target_id}")
+
+    for item in items:
+        link_tag = item.find('a', class_='itemtitle')
+        link = link_tag.get('href') if link_tag else None
+        if not link:
+            continue
+        pid = extract_post_id(link)
+        try:
+            if int(pid) == target_id:
+                return parse_news_item(item, link)
+        except ValueError:
+            continue
+    return None
+
+
+# ---------- Fallback: парсим пост напрямую с t.me ----------
+def fetch_news_direct(post_id):
+    """Если поста уже нет в RSS — идём по прямой ссылке t.me/канал/номер"""
+    url = f"https://t.me/{CHANNEL_HANDLE}/{post_id}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Не удалось открыть {url}: {e}")
+        return None
+
+    soup = BeautifulSoup(r.text, 'html.parser')
+    text_div = soup.find('div', class_='tgme_widget_message_text')
+    if not text_div:
+        print(f"⚠️ На странице {url} не найден блок с текстом поста.")
+        return None
+
+    print(f"✅ Текст для поста {post_id} взят напрямую с {url}")
+    return parse_text_div(text_div, url)
 
 
 # ---------- Сборка подписи ----------
@@ -262,6 +290,11 @@ def main():
     news = fetch_news_by_id(target_id, cache_counter)
     history["cache_counter"] = cache_counter + 1
 
+    # 👇 Главное исправление: если в RSS поста уже нет — идём на t.me напрямую
+    if not news:
+        print(f"🔎 В RSS поста {target_id} уже нет, пробую напрямую с t.me...")
+        news = fetch_news_direct(target_id)
+
     if not news:
         count = retries.get(str(target_id), 0) + 1
         retries[str(target_id)] = count
@@ -274,7 +307,7 @@ def main():
             retries.pop(str(target_id), None)
             history["retry_counts"] = retries
         else:
-            print(f"⚠️ Новость ID {target_id} не найдена в RSS (попытка {count}/{MAX_RETRIES}). Попробуем в следующем запуске.")
+            print(f"⚠️ Новость ID {target_id} не найдена (попытка {count}/{MAX_RETRIES}). Попробуем в следующем запуске.")
         save_history(history)
         return
 
