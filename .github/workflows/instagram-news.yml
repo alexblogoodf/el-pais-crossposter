@@ -2,7 +2,7 @@ name: Instagram News (Buffer)
 
 on:
   schedule:
-    - cron: '*/30 * * * *'   # каждые 30 минут
+    - cron: '*/33 * * * *'
   workflow_dispatch:          # ручной запуск для проверки
 
 jobs:
