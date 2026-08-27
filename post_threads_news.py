@@ -127,11 +127,11 @@ def tweet_len(text):
 
 
 def build_threads_text(title_raw, link):
-    """Формирует текст для Threads: topic + заголовок + ссылка (без хештегов)"""
-    topic = "Новости"
+    """Формирует текст для Threads: #Новости (как топик) + заголовок + ссылка (без других хештегов)"""
+    topic_hashtag = "#Новости"
     suffix = "\n\nЧитать в телеграм 👉 "
     
-    available = MAX_TEXT_LENGTH - len(topic) - tweet_len(suffix) - 23 - 4
+    available = MAX_TEXT_LENGTH - len(topic_hashtag) - tweet_len(suffix) - 23 - 4
     title = title_raw.strip()
     
     if tweet_len(title) > available:
@@ -139,7 +139,7 @@ def build_threads_text(title_raw, link):
             title = title[:-1]
         title = title.rstrip() + "…"
     
-    return f"{topic}\n\n{title}{suffix}{link}"
+    return f"{topic_hashtag}\n\n{title}{suffix}{link}"
 
 
 # ---------- Buffer API ----------
