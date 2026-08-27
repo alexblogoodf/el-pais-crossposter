@@ -2,7 +2,7 @@ name: Threads News (Buffer)
 
 on:
   schedule:
-    - cron: '20,50 * * * *'   # каждые 30 минут (в 20 и 50 минут часа)
+    - cron: '*/29 * * * *' 
   workflow_dispatch:           # ручной запуск для проверки
 
 jobs:
