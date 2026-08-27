@@ -1,9 +1,7 @@
 name: Threads News (Buffer)
 
 on:
-  schedule:
-    - cron: '16,46 * * * *' 
-  workflow_dispatch:           # ручной запуск для проверки
+  workflow_dispatch:
 
 jobs:
   post-threads:
