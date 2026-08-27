@@ -1,0 +1,42 @@
+name: Threads News (Buffer)
+
+on:
+  schedule:
+    - cron: '20,50 * * * *'   # каждые 30 минут (в 20 и 50 минут часа)
+  workflow_dispatch:           # ручной запуск для проверки
+
+jobs:
+  post-threads:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Скачиваем репозиторий (с папкой banners)
+        uses: actions/checkout@v4
+
+      - name: Устанавливаем Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Устанавливаем зависимости
+        run: pip install requests beautifulsoup4
+
+      - name: Публикуем одну новость в Threads
+        env:
+          BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
+        run: python post_threads_news.py
+
+      - name: Сохраняем историю
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add threads_posted_history.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update Threads history [skip ci]"
+            git pull --rebase --autostash origin main || true
+            git push
+          else
+            echo "История не изменилась — коммит не нужен."
+          fi
