@@ -12,6 +12,7 @@ HISTORY_FILE = "threads_posted_history.json"
 BANNERS_DIR  = "banners"
 
 MAX_TEXT_LENGTH = 500  # Лимит Threads ~500 символов
+TOPIC_TAG = "Новости"  # Топик для Threads
 # =================================================
 
 
@@ -127,11 +128,10 @@ def tweet_len(text):
 
 
 def build_threads_text(title_raw, link):
-    """Формирует текст для Threads: #Новости (как топик) + заголовок + ссылка (без других хештегов)"""
-    topic_hashtag = "#Новости"
+    """Формирует текст для Threads: заголовок + ссылка (без хештегов, без топика в тексте)"""
     suffix = "\n\nЧитать в телеграм 👉 "
     
-    available = MAX_TEXT_LENGTH - len(topic_hashtag) - tweet_len(suffix) - 23 - 4
+    available = MAX_TEXT_LENGTH - tweet_len(suffix) - 23 - 4
     title = title_raw.strip()
     
     if tweet_len(title) > available:
@@ -139,7 +139,7 @@ def build_threads_text(title_raw, link):
             title = title[:-1]
         title = title.rstrip() + "…"
     
-    return f"{topic_hashtag}\n\n{title}{suffix}{link}"
+    return f"{title}{suffix}{link}"
 
 
 # ---------- Buffer API ----------
@@ -171,10 +171,13 @@ def get_threads_channel_id(token):
     raise Exception("К Buffer не подключен Threads-канал")
 
 
-def buffer_create_threads_post(token, channel_id, text, image_url):
+def buffer_create_threads_post(token, channel_id, text, image_url, topic_tag):
+    """Создаёт пост в Threads с топиком через metadata.threads.topic"""
     text_lit = json.dumps(text, ensure_ascii=False)
     ch_lit   = json.dumps(channel_id)
     url_lit  = json.dumps(image_url)
+    topic_lit = json.dumps(topic_tag, ensure_ascii=False)
+    
     query = f'''mutation {{
   createPost(input: {{
     text: {text_lit},
@@ -184,7 +187,7 @@ def buffer_create_threads_post(token, channel_id, text, image_url):
     assets: [{{ image: {{ url: {url_lit} }} }}],
     metadata: {{
       threads: {{
-        type: post
+        topic: {topic_lit}
       }}
     }}
   }}) {{
@@ -273,6 +276,7 @@ def main():
 
     text = build_threads_text(news['title_raw'], news['link'])
     print(f"📝 Текст для Threads:\n{text}\n")
+    print(f"🏷️ Топик: {TOPIC_TAG}\n")
 
     repo   = os.environ.get("GITHUB_REPOSITORY", "")
     branch = os.environ.get("GITHUB_REF_NAME", "main")
@@ -281,7 +285,7 @@ def main():
 
     try:
         channel_id = get_threads_channel_id(token)
-        ok, info = buffer_create_threads_post(token, channel_id, text, image_url)
+        ok, info = buffer_create_threads_post(token, channel_id, text, image_url, TOPIC_TAG)
     except Exception as e:
         ok, info = False, str(e)
 
