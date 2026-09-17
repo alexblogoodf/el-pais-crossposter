@@ -11,9 +11,8 @@ BUFFER_API = "https://api.buffer.com"
 HISTORY_FILE = "threads_posted_history.json"
 BANNERS_DIR  = "banners"
 
-MAX_TEXT_LENGTH = 500
-# Убираем топик или делаем нейтральным — иногда это триггерит модерацию
-TOPIC_TAG = None  # Можно попробовать "news" или None
+MAX_TEXT_LENGTH = 500   # лимит Threads ~500 символов
+TOPIC_TAG = "Испания"   # 👈 топик ВЕРНУЛИ
 # =================================================
 
 
@@ -35,6 +34,7 @@ def save_history(h):
 
 # ---------- Парсинг RSS ----------
 def extract_post_id(link):
+    """Извлекает номер поста из ссылки: https://t.me/elpaisru/107 -> 107 (как int)"""
     raw = link.rstrip("/").split("/")[-1].split("?")[0].split("#")[0]
     try:
         return int(raw)
@@ -45,13 +45,11 @@ def extract_post_id(link):
 def parse_text_div(text_div, link):
     title_raw, full_text = "", ""
     if text_div:
-        # Заголовок = первый <b>
         for b in text_div.find_all('b'):
             raw = b.get_text().strip()
             if raw:
                 title_raw = raw
                 break
-        # Полный текст с переносами
         for br in text_div.find_all('br'):
             br.replace_with('\n')
         full_text = text_div.get_text()
@@ -67,6 +65,7 @@ def parse_text_div(text_div, link):
 
 
 def fetch_all_rss_news(cache_counter):
+    """Возвращает словарь {int_ID: {title_raw, full_text, link}} всех постов из RSS"""
     bridge_url = f"{BRIDGE_URL}&_cache_timeout={cache_counter}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
@@ -101,6 +100,7 @@ def fetch_all_rss_news(cache_counter):
 
 
 def get_available_banner_ids():
+    """Возвращает список int-номеров баннеров из папки banners/"""
     if not os.path.isdir(BANNERS_DIR):
         print(f"❌ Папка {BANNERS_DIR} не найдена.")
         return []
@@ -114,6 +114,7 @@ def get_available_banner_ids():
 
 # ---------- Форматирование текста для Threads ----------
 def tweet_len(text):
+    """Подсчёт длины текста с учётом эмодзи"""
     n = 0
     for ch in text:
         o = ord(ch)
@@ -125,32 +126,44 @@ def tweet_len(text):
 
 
 def build_threads_text(title_raw, full_text):
-    """Берём заголовок + первые 2-3 предложения из текста"""
-    # Убираем хештеги и ссылки из текста
+    """Заголовок + первые 2-3 предложения тела (БЕЗ дублирования заголовка)"""
+    title = title_raw.strip()
+
+    # Чистим текст: убираем хештеги и ссылки
     clean_text = full_text
-    clean_text = re.sub(r'#[^\s#]+', '', clean_text)  # убираем хештеги
-    clean_text = re.sub(r'https?://\S+', '', clean_text)  # убираем ссылки
+    clean_text = re.sub(r'#[^\s#]+', '', clean_text)
+    clean_text = re.sub(r'https?://\S+', '', clean_text)
     clean_text = re.sub(r'(?<!\w)t\.me/\S+', '', clean_text)
-    
-    # Разбиваем на предложения
-    sentences = re.split(r'(?<=[.!?])\s+', clean_text)
+
+    # 👇 ГЛАВНЫЙ ФИКС: срезаем заголовок из начала текста,
+    # чтобы он не попал в "тело" второй раз
+    body_src = clean_text.strip()
+    if title and body_src.startswith(title):
+        body_src = body_src[len(title):].strip()
+
+    # Разбиваем оставшийся текст на предложения
+    sentences = re.split(r'(?<=[.!?…])\s+', body_src)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
-    
-    # Берём первые 2-3 предложения (но не более 300 символов)
+
+    # Берём первые 2-3 предложения (не более ~300 символов)
     body = ""
     for sent in sentences[:3]:
         if tweet_len(body + " " + sent) < 300:
             body += (" " if body else "") + sent
-    
-    # Собираем финальный текст: заголовок + тело
-    title = title_raw.strip()
+
+    # Страховка: если тело всё равно начинается с заголовка — срезаем ещё раз
+    if body.startswith(title):
+        body = body[len(title):].strip()
+
+    # Обрезаем заголовок, если слишком длинный
     if tweet_len(title) > 150:
         title = title[:147] + "…"
-    
+
+    # Обрезаем тело под лимит Threads
     available = MAX_TEXT_LENGTH - tweet_len(title) - 10
     if tweet_len(body) > available:
-        body = body[:max(available - 3, 0)] + "…"
-    
+        body = body[:max(available - 3, 0)].rstrip() + "…"
+
     if body:
         return f"{title}\n\n{body}"
     return title
@@ -185,17 +198,22 @@ def get_threads_channel_id(token):
     raise Exception("К Buffer не подключен Threads-канал")
 
 
-def buffer_create_threads_post_with_reply(token, channel_id, main_text, reply_text, image_url, topic_tag=None):
-    """Создаёт тред в Threads: основной пост + первый комментарий (reply)"""
-    text_lit = json.dumps(main_text, ensure_ascii=False)
+def buffer_create_threads_post_with_reply(token, channel_id, main_text, reply_text, image_url, topic_tag):
+    """Создаёт тред: основной пост (с топиком и картинкой) + первый комментарий (reply)"""
+    text_lit  = json.dumps(main_text, ensure_ascii=False)
     reply_lit = json.dumps(reply_text, ensure_ascii=False)
-    ch_lit   = json.dumps(channel_id)
-    url_lit  = json.dumps(image_url)
-    
-    # Формируем metadata с топиком (если есть)
-    if topic_tag:
-        topic_lit = json.dumps(topic_tag, ensure_ascii=False)
-        threads_metadata = f'''threads: {{
+    ch_lit    = json.dumps(channel_id)
+    url_lit   = json.dumps(image_url)
+    topic_lit = json.dumps(topic_tag, ensure_ascii=False)
+
+    query = f'''mutation {{
+  createPost(input: {{
+    text: {text_lit},
+    channelId: {ch_lit},
+    schedulingType: automatic,
+    mode: shareNow,
+    metadata: {{
+      threads: {{
         topic: {topic_lit},
         thread: [
           {{
@@ -206,28 +224,7 @@ def buffer_create_threads_post_with_reply(token, channel_id, main_text, reply_te
             text: {reply_lit}
           }}
         ]
-      }}'''
-    else:
-        threads_metadata = f'''threads: {{
-        thread: [
-          {{
-            text: {text_lit},
-            assets: [{{ image: {{ url: {url_lit} }} }}]
-          }},
-          {{
-            text: {reply_lit}
-          }}
-        ]
-      }}'''
-    
-    query = f'''mutation {{
-  createPost(input: {{
-    text: {text_lit},
-    channelId: {ch_lit},
-    schedulingType: automatic,
-    mode: shareNow,
-    metadata: {{
-      {threads_metadata}
+      }}
     }}
   }}) {{
     ... on PostActionSuccess {{ post {{ id text status dueAt }} }}
@@ -243,14 +240,7 @@ def buffer_create_threads_post_with_reply(token, channel_id, main_text, reply_te
         print(f"📊 Статус поста в Buffer: {status}")
         if due_at:
             print(f"📅 Запланирован на: {due_at}")
-        if status in ["sent", "published"]:
-            return True, post.get("id")
-        elif status in ["pending", "scheduled"]:
-            print(f"⏳ Пост запланирован, но еще не опубликован (статус: {status})")
-            return True, post.get("id")
-        else:
-            print(f"⚠️ Неожиданный статус: {status}")
-            return True, post.get("id")
+        return True, post.get("id")
     return False, res.get("message", "неизвестная ошибка Buffer")
 
 
@@ -308,13 +298,12 @@ def main():
     print(f"\n🎯 Публикуем баннер: {banner_path}")
     print(f"📝 Заголовок: {news['title_raw']}")
 
-    # Теперь берём заголовок + часть текста новости
-    main_text = build_threads_text(news['title_raw'], news['full_text'])
+    main_text  = build_threads_text(news['title_raw'], news['full_text'])
     reply_text = f"Читать в телеграм 👉 {news['link']}"
-    
+
     print(f"📝 Основной текст:\n{main_text}\n")
     print(f"💬 Комментарий (reply):\n{reply_text}\n")
-    print(f"🏷️ Топик: {TOPIC_TAG or 'не указан'}\n")
+    print(f"🏷️ Топик: {TOPIC_TAG}\n")
 
     repo   = os.environ.get("GITHUB_REPOSITORY", "")
     branch = os.environ.get("GITHUB_REF_NAME", "main")
