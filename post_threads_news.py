@@ -126,7 +126,7 @@ def tweet_len(text):
 
 
 def build_threads_text(title_raw, full_text):
-    """Заголовок + первые 2-3 предложения тела (БЕЗ дублирования заголовка)"""
+    """Заголовок + первые 2-3 предложения тела (без дублей и без «Читать оригинал»)"""
     title = title_raw.strip()
 
     # Чистим текст: убираем хештеги и ссылки
@@ -135,15 +135,31 @@ def build_threads_text(title_raw, full_text):
     clean_text = re.sub(r'https?://\S+', '', clean_text)
     clean_text = re.sub(r'(?<!\w)t\.me/\S+', '', clean_text)
 
-    # 👇 ГЛАВНЫЙ ФИКС: срезаем заголовок из начала текста,
-    # чтобы он не попал в "тело" второй раз
+    # 👇 Убираем строки-рудименты: «🔗 Читать оригинал (El País)»
+    # и строки, состоящие только из эмодзи (одинокий 🔗 и т.п.)
+    lines = []
+    for line in clean_text.split('\n'):
+        s = line.strip()
+        if not s:
+            lines.append('')
+            continue
+        if 'читать оригинал' in s.lower():
+            continue
+        if re.fullmatch(r'[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF\U0000FE0F\U0000200D\s]+', s):
+            continue
+        lines.append(s)
+    clean_text = '\n'.join(lines)
+
+    # Срезаем заголовок из начала текста, чтобы не дублировать
     body_src = clean_text.strip()
     if title and body_src.startswith(title):
         body_src = body_src[len(title):].strip()
 
-    # Разбиваем оставшийся текст на предложения
+    # Разбиваем на предложения
     sentences = re.split(r'(?<=[.!?…])\s+', body_src)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
+    # Страховка: отбрасываем предложения с «читать оригинал», если вдруг проскочили
+    sentences = [s for s in sentences if 'читать оригинал' not in s.lower()]
 
     # Берём первые 2-3 предложения (не более ~300 символов)
     body = ""
@@ -151,7 +167,7 @@ def build_threads_text(title_raw, full_text):
         if tweet_len(body + " " + sent) < 300:
             body += (" " if body else "") + sent
 
-    # Страховка: если тело всё равно начинается с заголовка — срезаем ещё раз
+    # Страховка от дубля заголовка
     if body.startswith(title):
         body = body[len(title):].strip()
 
