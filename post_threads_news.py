@@ -1,18 +1,23 @@
 import os
 import re
 import json
+import time
 import requests
 from bs4 import BeautifulSoup
 
 # ================== НАСТРОЙКИ ==================
 BRIDGE_URL = "https://rss-bridge.org/bridge01/?action=display&username=elpaisru&bridge=TelegramBridge&format=Html"
-BUFFER_API = "https://api.buffer.com"
 
 HISTORY_FILE = "threads_posted_history.json"
 BANNERS_DIR  = "banners"
 
-MAX_TEXT_LENGTH = 500  # Лимит Threads ~500 символов
-TOPIC_TAG = "Новости"  # Топик для Threads
+MAX_TEXT_LENGTH = 500
+TOPIC_TAG = "Испания"  # Изменили с "Новости" на "Испания"
+
+# Threads Graph API
+ACCESS_TOKEN = os.environ.get("THREADS_ACCESS_TOKEN")
+USER_ID = os.environ.get("THREADS_USER_ID")
+GRAPH_URL = "https://graph.threads.net/v1.0"
 # =================================================
 
 
@@ -127,11 +132,9 @@ def tweet_len(text):
     return n
 
 
-def build_threads_text(title_raw, link):
-    """Формирует текст для Threads: заголовок + ссылка (без хештегов, без топика в тексте)"""
-    suffix = "\n\nЧитать в телеграм 👉 "
-    
-    available = MAX_TEXT_LENGTH - tweet_len(suffix) - 23 - 4
+def build_threads_text(title_raw):
+    """Формирует текст для Threads: только заголовок (без ссылки, без хештегов)"""
+    available = MAX_TEXT_LENGTH
     title = title_raw.strip()
     
     if tweet_len(title) > available:
@@ -139,87 +142,89 @@ def build_threads_text(title_raw, link):
             title = title[:-1]
         title = title.rstrip() + "…"
     
-    return f"{title}{suffix}{link}"
+    return title
 
 
-# ---------- Buffer API ----------
-def buffer_graphql(token, query):
-    r = requests.post(BUFFER_API,
-                      headers={"Content-Type": "application/json",
-                               "Authorization": f"Bearer {token}"},
-                      json={"query": query}, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("errors"):
-        raise Exception(f"GraphQL error: {data['errors']}")
-    return data["data"]
-
-
-def get_threads_channel_id(token):
-    data = buffer_graphql(token, "query { account { organizations { id name } } }")
-    orgs = data["account"]["organizations"]
-    if not orgs:
-        raise Exception("В аккаунте Buffer нет организаций")
-    org_id = orgs[0]["id"]
-    data = buffer_graphql(token,
-        'query { channels(input: { organizationId: "%s" }) { id name service } }' % org_id)
-    channels = data.get("channels", [])
-    for ch in channels:
-        if ch.get("service") == "threads":
-            print(f"🧵 Найден Threads-канал: {ch['name']}")
-            return ch["id"]
-    raise Exception("К Buffer не подключен Threads-канал")
-
-
-def buffer_create_threads_post(token, channel_id, text, image_url, topic_tag):
-    """Создаёт пост в Threads с топиком через metadata.threads.topic"""
-    text_lit = json.dumps(text, ensure_ascii=False)
-    ch_lit   = json.dumps(channel_id)
-    url_lit  = json.dumps(image_url)
-    topic_lit = json.dumps(topic_tag, ensure_ascii=False)
+# ---------- Threads Graph API ----------
+def create_threads_container(text, image_url, topic_tag=None):
+    """Создаёт контейнер для основного поста"""
+    url = f"{GRAPH_URL}/{USER_ID}/threads"
+    payload = {
+        "access_token": ACCESS_TOKEN,
+        "text": text,
+        "media_type": "IMAGE",
+        "image_url": image_url
+    }
+    if topic_tag:
+        payload["topic_tag"] = topic_tag
     
-    query = f'''mutation {{
-  createPost(input: {{
-    text: {text_lit},
-    channelId: {ch_lit},
-    schedulingType: automatic,
-    mode: shareNow,
-    assets: [{{ image: {{ url: {url_lit} }} }}],
-    metadata: {{
-      threads: {{
-        topic: {topic_lit}
-      }}
-    }}
-  }}) {{
-    ... on PostActionSuccess {{ post {{ id text status dueAt }} }}
-    ... on MutationError {{ message }}
-  }}
-}}'''
-    data = buffer_graphql(token, query)
-    res = data.get("createPost", {})
-    if res.get("post"):
-        post = res["post"]
-        status = post.get("status")
-        due_at = post.get("dueAt")
-        print(f"📊 Статус поста в Buffer: {status}")
-        if due_at:
-            print(f"📅 Запланирован на: {due_at}")
-        if status in ["sent", "published"]:
-            return True, post.get("id")
-        elif status in ["pending", "scheduled"]:
-            print(f"⏳ Пост запланирован, но еще не опубликован (статус: {status})")
-            return True, post.get("id")
-        else:
-            print(f"⚠️ Неожиданный статус: {status}")
-            return True, post.get("id")
-    return False, res.get("message", "неизвестная ошибка Buffer")
+    res = requests.post(url, data=payload, timeout=30).json()
+    if "id" not in res:
+        raise Exception(f"Ошибка создания контейнера: {res}")
+    return res["id"]
+
+
+def create_reply_container(text, reply_to_id):
+    """Создаёт контейнер для комментария (reply)"""
+    url = f"{GRAPH_URL}/{USER_ID}/threads"
+    payload = {
+        "access_token": ACCESS_TOKEN,
+        "text": text,
+        "media_type": "TEXT",
+        "reply_to_id": reply_to_id
+    }
+    
+    res = requests.post(url, data=payload, timeout=30).json()
+    if "id" not in res:
+        raise Exception(f"Ошибка создания reply-контейнера: {res}")
+    return res["id"]
+
+
+def publish_container(creation_id):
+    """Публикует подготовленный контейнер"""
+    url = f"{GRAPH_URL}/{USER_ID}/threads_publish"
+    payload = {
+        "access_token": ACCESS_TOKEN,
+        "creation_id": creation_id
+    }
+    
+    res = requests.post(url, data=payload, timeout=30).json()
+    if "id" not in res:
+        raise Exception(f"Ошибка публикации: {res}")
+    return res["id"]
+
+
+def check_container_status(container_id):
+    """Проверяет статус обработки контейнера"""
+    url = f"{GRAPH_URL}/{container_id}"
+    payload = {
+        "access_token": ACCESS_TOKEN,
+        "fields": "status,error_message"
+    }
+    
+    # Ждём 15 секунд перед первой проверкой
+    time.sleep(15)
+    
+    max_attempts = 8
+    for attempt in range(max_attempts):
+        res = requests.get(url, params=payload, timeout=15).json()
+        status = res.get("status")
+        
+        if status == "FINISHED":
+            return True
+        elif status == "ERROR":
+            raise Exception(f"Ошибка обработки: {res.get('error_message')}")
+        
+        # Если ещё в процессе, ждём ещё 10 секунд
+        time.sleep(10)
+    
+    raise Exception("Таймаут: Threads не успел обработать картинку за 90 секунд")
 
 
 # ---------- Главный сценарий ----------
 def main():
-    token = os.environ.get("BUFFER_API_KEY", "")
-    if not token:
-        print("⚠️ BUFFER_API_KEY не задан в секретах — выходим.")
+    if not ACCESS_TOKEN or not USER_ID:
+        print("⚠️ THREADS_ACCESS_TOKEN или THREADS_USER_ID не заданы в секретах — выходим.")
         return
     if not os.environ.get("GITHUB_REPOSITORY"):
         print("❌ Запуск вне GitHub Actions (нет GITHUB_REPOSITORY).")
@@ -274,8 +279,9 @@ def main():
     print(f"\n🎯 Публикуем баннер: {banner_path}")
     print(f"📝 Заголовок: {news['title_raw']}")
 
-    text = build_threads_text(news['title_raw'], news['link'])
-    print(f"📝 Текст для Threads:\n{text}\n")
+    # Основной пост: только заголовок
+    main_text = build_threads_text(news['title_raw'])
+    print(f"📝 Основной текст:\n{main_text}\n")
     print(f"🏷️ Топик: {TOPIC_TAG}\n")
 
     repo   = os.environ.get("GITHUB_REPOSITORY", "")
@@ -283,26 +289,46 @@ def main():
     image_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{banner_path}"
     print(f"🖼 Картинка: {image_url}")
 
+    # Комментарий: ссылка на телеграм
+    reply_text = f"Читать в телеграм 👉 {news['link']}"
+    print(f"💬 Комментарий:\n{reply_text}\n")
+
     try:
-        channel_id = get_threads_channel_id(token)
-        ok, info = buffer_create_threads_post(token, channel_id, text, image_url, TOPIC_TAG)
-    except Exception as e:
-        ok, info = False, str(e)
-
-    already = ("already got this one scheduled" in str(info)
-               or "same thing twice" in str(info))
-
-    if ok or already:
-        if already:
-            print("⚠️ Buffer сообщает, что пост уже запланирован. Помечаем как запощенный.")
-        else:
-            print(f"✅ Пост принят Buffer, id: {info}")
+        # 1. Создаём основной пост
+        print("⏳ Создаём основной пост...")
+        main_container_id = create_threads_container(main_text, image_url, TOPIC_TAG)
+        print(f"✅ Основной контейнер создан: {main_container_id}")
+        
+        # 2. Ждём обработки картинки
+        print("⏳ Ждём обработки картинки...")
+        check_container_status(main_container_id)
+        
+        # 3. Публикуем основной пост
+        print("⏳ Публикуем основной пост...")
+        published_main_id = publish_container(main_container_id)
+        print(f"✅ Основной пост опубликован! ID: {published_main_id}")
+        
+        # 4. Создаём комментарий
+        time.sleep(3)  # Небольшая задержка перед созданием reply
+        print("⏳ Создаём комментарий...")
+        reply_container_id = create_reply_container(reply_text, published_main_id)
+        print(f"✅ Контейнер комментария создан: {reply_container_id}")
+        
+        # 5. Публикуем комментарий
+        time.sleep(2)
+        print("⏳ Публикуем комментарий...")
+        published_reply_id = publish_container(reply_container_id)
+        print(f"✅ Комментарий опубликован! ID: {published_reply_id}")
+        
+        # Успех!
         posted_ids.add(target_str)
         history["posted"] = sorted(list(posted_ids))[-500:]
         save_history(history)
         print("💾 История обновлена.")
-    else:
-        print(f"❌ Buffer не опубликовал: {info}. Повторим в следующем запуске.")
+        
+    except Exception as e:
+        print(f"❌ Ошибка при публикации: {e}")
+        save_history(history)
 
 
 if __name__ == "__main__":
