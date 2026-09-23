@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import json
+import time
 import requests
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -12,6 +13,15 @@ HISTORY_FILE = "posted_history.json"
 PENDING_FILE = "pending_tweet.json"
 BUFFER_API = "https://api.buffer.com"
 
+# 🖼️ Маппинг ключевых слов → fallback-картинки
+FALLBACK_IMAGES = {
+    'people_with_flags.jpg': ['протест', 'митинг', 'демонстрация', 'акция', 'манифестация', 'pp', 'vox'],
+    'government_building.jpg': ['правительство', 'парламент', 'закон', 'министр', 'санчес', 'конгресс', 'сенат', 'амнистия', 'депутат'],
+    'police_officers.jpg': ['полиция', 'задержание', 'арест', 'миграция', 'мигрант', 'граница', 'сеута', 'мелилья', 'нелегал'],
+    'city_life.jpg': ['мадрид', 'барселона', 'город', 'улица', 'район', 'валенси', 'севилья', 'малага'],
+    'old_castle.jpg': ['история', 'культура', 'туризм', 'музей', 'собор', 'достопримечательность', 'архитектур'],
+    'Flag_of_Spain.jpg': []  # дефолт для всех новостей Испании
+}
 
 def remove_emojis(text):
     emoji_pattern = re.compile(
@@ -35,9 +45,7 @@ def remove_emojis(text):
         "]+", flags=re.UNICODE)
     return emoji_pattern.sub(r'', text).strip()
 
-
 def get_all_posts_from_rss_bridge(cache_counter):
-    # Добавляем счётчик в URL, чтобы каждый запрос был уникальным для сервера
     bridge_url = f"{BRIDGE_URL}&_cache_timeout={cache_counter}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
@@ -46,19 +54,16 @@ def get_all_posts_from_rss_bridge(cache_counter):
     except requests.exceptions.RequestException as e:
         print(f"❌ Ошибка доступа к RSS-Bridge: {e}")
         return []
-
     soup = BeautifulSoup(response.text, 'html.parser')
     items = soup.find_all('section', class_='feeditem')
     if not items:
         items = soup.find_all('div', class_='item') or soup.find_all('article')
-
     posts = []
     for item in items:
         link_tag = item.find('a', class_='itemtitle')
         link = link_tag.get('href') if link_tag else None
         if not link:
             continue
-
         title_raw = ""
         hashtags = []
         text_div = item.find('div', class_='tgme_widget_message_text')
@@ -72,21 +77,16 @@ def get_all_posts_from_rss_bridge(cache_counter):
                 t = a.get_text().strip()
                 if t.startswith('#') and t not in hashtags:
                     hashtags.append(t)
-
         image_url = None
-        # 1. Сначала ищем картинку в <blockquote> (старый формат)
         blockquote = item.find('blockquote')
         if blockquote:
             img_tag = blockquote.find('img')
             if img_tag and img_tag.get('src'):
                 image_url = img_tag.get('src')
-
-        # 2. Если не нашли — ищем картинку прямо в item-content перед текстом поста (новый формат)
         if not image_url:
             content_div = item.find('div', class_='item-content')
             if content_div:
                 text_div = content_div.find('div', class_='tgme_widget_message_text')
-                # Берём первый <img>, который НЕ внутри текста поста
                 for img in content_div.find_all('img'):
                     if text_div and img.find_parent('div', class_='tgme_widget_message_text'):
                         continue
@@ -102,7 +102,6 @@ def get_all_posts_from_rss_bridge(cache_counter):
         })
     return posts
 
-
 def tweet_len(text):
     n = 0
     for ch in text:
@@ -113,7 +112,6 @@ def tweet_len(text):
             n += 1
     return n
 
-
 def build_tweet_text(title_raw, link, hashtags=None):
     mandatory = ["#новости", "#эльпаис"]
     tags = []
@@ -121,9 +119,7 @@ def build_tweet_text(title_raw, link, hashtags=None):
         t = t.strip()
         if t and t.lower() not in {x.lower() for x in tags}:
             tags.append(t)
-
     suffix = "\n\nЧитать в телеграм 👉 "
-
     while len(tags) > len(mandatory):
         tags_line = "\n\n" + " ".join(tags)
         if tweet_len(suffix) + 23 + tweet_len(tags_line) + 30 <= 280:
@@ -134,7 +130,6 @@ def build_tweet_text(title_raw, link, hashtags=None):
                 break
         else:
             break
-
     tags_line = "\n\n" + " ".join(tags)
     available = 280 - tweet_len(suffix) - 23 - tweet_len(tags_line)
     title = title_raw.strip()
@@ -144,35 +139,99 @@ def build_tweet_text(title_raw, link, hashtags=None):
         title = title.rstrip() + "…"
     return f"{title}{suffix}{link}{tags_line}"
 
+# 🆕 Выбор подходящей fallback-картинки по ключевым словам
+def select_fallback_image(title, text='', hashtags=None):
+    combined_text = f"{title} {text} {' '.join(hashtags or [])}".lower()
+    
+    for img_name, keywords in FALLBACK_IMAGES.items():
+        if not keywords:
+            continue
+        for keyword in keywords:
+            if keyword in combined_text:
+                img_path = f"images/{img_name}"
+                if os.path.exists(img_path):
+                    print(f"🖼️ Fallback выбран: {img_name} (совпадение: '{keyword}')")
+                    return img_path
+    
+    default_img = "images/Flag_of_Spain.jpg"
+    if os.path.exists(default_img):
+        print(f"🖼️ Fallback по умолчанию: Flag_of_Spain.jpg")
+        return default_img
+    return None
 
-def generate_card(image_url, title_text, output_path="banner.jpg"):
-    if not image_url:
+def generate_card(image_url, title_text, fallback_context=None, output_path="banner.jpg"):
+    img = None
+    
+    # 1. Пытаемся загрузить оригинальную картинку (с ретраями)
+    if image_url:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
+        }
+        for attempt in range(3):
+            try:
+                response = requests.get(image_url, headers=headers, timeout=15, stream=True)
+                
+                if response.status_code != 200:
+                    print(f"⚠️ HTTP {response.status_code} (попытка {attempt+1}/3)")
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                        continue
+                    break
+                
+                content_type = response.headers.get('content-type', '')
+                if not content_type.startswith('image/'):
+                    print(f"⚠️ Не image, а {content_type}")
+                    break
+                
+                with open("temp_src.jpg", "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                img = Image.open("temp_src.jpg").convert("RGBA")
+                print("✅ Картинка успешно загружена из Telegram CDN")
+                break
+                
+            except (requests.exceptions.RequestException, IOError) as e:
+                print(f"⚠️ Ошибка загрузки (попытка {attempt+1}/3): {e}")
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+    
+    # 2. Если не удалось — умный fallback
+    if img is None and fallback_context:
+        fallback_path = select_fallback_image(
+            fallback_context.get('title', ''),
+            fallback_context.get('text', ''),
+            fallback_context.get('hashtags', [])
+        )
+        if fallback_path:
+            try:
+                img = Image.open(fallback_path).convert("RGBA")
+            except Exception as e:
+                print(f"⚠️ Fallback не открылся: {e}")
+    
+    # 3. Последний рубеж — чёрный фон
+    if img is None:
+        print("⚠️ Ни оригинала, ни fallback нет — используем чёрный фон")
         img = Image.new("RGBA", (1080, 1080), (30, 30, 30, 255))
-    else:
-        try:
-            img_data = requests.get(image_url, timeout=10).content
-            with open("temp_src.jpg", "wb") as f:
-                f.write(img_data)
-            img = Image.open("temp_src.jpg").convert("RGBA")
-        except Exception as e:
-            print(f"⚠️ Не удалось загрузить картинку: {e}. Используем темный фон.")
-            img = Image.new("RGBA", (1080, 1080), (30, 30, 30, 255))
-
+    
     width, height = img.size
     min_side = min(width, height)
     img = img.crop(((width - min_side) / 2, (height - min_side) / 2,
                     (width + min_side) / 2, (height + min_side) / 2))
     img = img.resize((1080, 1080), Image.Resampling.LANCZOS)
     img = Image.alpha_composite(img, Image.new("RGBA", (1080, 1080), (0, 0, 0, 102)))
-
+    
     txt_layer = Image.new("RGBA", (1080, 1080), (0, 0, 0, 0))
     draw = ImageDraw.Draw(txt_layer)
+    
     try:
         font = ImageFont.truetype("Exo2-Black.ttf", 56)
     except Exception:
         print("⚠️ Шрифт Exo2-Black.ttf не найден, используется стандартный.")
         font = ImageFont.load_default()
-
+    
     def get_wrapped_lines(text, font, max_width):
         lines = []
         for paragraph in text.split("\n"):
@@ -189,25 +248,26 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
             if current_line:
                 lines.append(current_line)
         return lines
-
+    
     lines = get_wrapped_lines(title_text, font, max_width=920)
     line_height = 70
     start_y = (1080 - len(lines) * line_height) / 2
-
+    
     shadow_layer = Image.new("RGBA", (1080, 1080), (0, 0, 0, 0))
     shadow_draw = ImageDraw.Draw(shadow_layer)
     for i, line in enumerate(lines):
         bbox = draw.textbbox((0, 0), line, font=font)
         shadow_draw.text(((1080 - (bbox[2] - bbox[0])) / 2, start_y + i * line_height),
                          line, font=font, fill=(0, 0, 0, 191))
+    
     img = Image.alpha_composite(img, shadow_layer.filter(ImageFilter.GaussianBlur(30)))
-
+    
     draw_final = ImageDraw.Draw(img)
     for i, line in enumerate(lines):
         bbox = draw_final.textbbox((0, 0), line, font=font)
         draw_final.text(((1080 - (bbox[2] - bbox[0])) / 2, start_y + i * line_height),
                         line, font=font, fill=(255, 255, 255, 255))
-
+    
     try:
         if os.path.exists("logo.svg"):
             cairosvg.svg2png(url="logo.svg", write_to="logo_temp.png", output_width=320)
@@ -217,16 +277,17 @@ def generate_card(image_url, title_text, output_path="banner.jpg"):
             print("⚠️ Файл logo.svg не найден — картинка будет без логотипа.")
     except Exception as e:
         print(f"⚠️ Ошибка при добавлении логотипа: {e}")
-
+    
     img.convert("RGB").save(output_path, quality=95)
+    
     for tf in ["temp_src.jpg", "logo_temp.png"]:
         if os.path.exists(tf):
             try:
                 os.remove(tf)
             except Exception:
                 pass
+    
     return output_path
-
 
 def buffer_graphql(token, query):
     r = requests.post(BUFFER_API,
@@ -238,7 +299,6 @@ def buffer_graphql(token, query):
     if data.get("errors"):
         raise Exception(f"GraphQL error: {data['errors']}")
     return data["data"]
-
 
 def get_buffer_channel_id(token):
     data = buffer_graphql(token, "query { account { organizations { id name } } }")
@@ -256,29 +316,27 @@ def get_buffer_channel_id(token):
         return channels[0]["id"]
     raise Exception("В Buffer не подключено ни одного канала")
 
-
 def buffer_create_post(token, channel_id, text, image_url):
     text_lit = json.dumps(text, ensure_ascii=False)
     ch_lit = json.dumps(channel_id)
     url_lit = json.dumps(image_url)
     query = f'''mutation {{
-  createPost(input: {{
-    text: {text_lit},
-    channelId: {ch_lit},
-    schedulingType: automatic,
-    mode: shareNow,
-    assets: [{{ image: {{ url: {url_lit} }} }}]
-  }}) {{
-    ... on PostActionSuccess {{ post {{ id text }} }}
-    ... on MutationError {{ message }}
-  }}
-}}'''
+        createPost(input: {{
+            text: {text_lit},
+            channelId: {ch_lit},
+            schedulingType: automatic,
+            mode: shareNow,
+            assets: [{{ image: {{ url: {url_lit} }} }}]
+        }}) {{
+            ... on PostActionSuccess {{ post {{ id text }} }}
+            ... on MutationError {{ message }}
+        }}
+    }}'''
     data = buffer_graphql(token, query)
     res = data.get("createPost", {})
     if res.get("post"):
         return True, res["post"].get("id")
     return False, res.get("message", "неизвестная ошибка Buffer")
-
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -289,29 +347,33 @@ def load_history():
             print(f"⚠️ Не удалось прочитать историю: {e}")
     return {"processed": [], "cache_counter": 1}
 
-
 def save_history(history):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
-
 
 def cmd_generate():
     print("Получаем новости из RSS-Bridge...")
     history = load_history()
     processed = set(history.get("processed", []))
     cache_counter = history.get("cache_counter", 1)
-
     posts = get_all_posts_from_rss_bridge(cache_counter)
     if not posts:
         print("❌ Не удалось получить новости.")
         history["cache_counter"] = cache_counter + 1
         save_history(history)
         return
-
     latest = posts[0]
-    generate_card(latest["image_url"], latest["title_clean"], output_path="banner.jpg")
+    generate_card(
+        latest["image_url"],
+        latest["title_clean"],
+        fallback_context={
+            'title': latest.get('title_raw', ''),
+            'text': '',
+            'hashtags': latest.get('hashtags', [])
+        },
+        output_path="banner.jpg"
+    )
     print("🎨 banner.jpg (последняя новость) создан.")
-
     first_run = len(processed) == 0
     if first_run:
         to_post = posts[0]
@@ -321,12 +383,20 @@ def cmd_generate():
     else:
         unposted = [p for p in reversed(posts) if p["link"] not in processed]
         to_post = unposted[0] if unposted else None
-
     if to_post:
         post_id = to_post["link"].rstrip("/").split("/")[-1]
         os.makedirs("banners", exist_ok=True)
         img_name = f"banners/{post_id}.jpg"
-        generate_card(to_post["image_url"], to_post["title_clean"], output_path=img_name)
+        generate_card(
+            to_post["image_url"],
+            to_post["title_clean"],
+            fallback_context={
+                'title': to_post.get('title_raw', ''),
+                'text': '',
+                'hashtags': to_post.get('hashtags', [])
+            },
+            output_path=img_name
+        )
         with open(PENDING_FILE, "w", encoding="utf-8") as f:
             json.dump({"link": to_post["link"],
                        "text": build_tweet_text(to_post["title_raw"], to_post["link"],
@@ -335,11 +405,9 @@ def cmd_generate():
         print(f"📦 Подготовлен твит: {to_post['link']}")
     else:
         print("😴 Новых новостей для твита нет.")
-
     history["processed"] = sorted(processed)[-500:]
     history["cache_counter"] = cache_counter + 1
     save_history(history)
-
     if os.path.isdir("banners"):
         files = sorted(os.listdir("banners"), key=lambda n: int(re.sub(r'\D', '', n) or 0))
         for name in files[:-20]:
@@ -348,7 +416,6 @@ def cmd_generate():
             except Exception:
                 pass
     print("💾 История обновлена.")
-
 
 def cmd_post():
     if not os.path.exists(PENDING_FILE):
@@ -360,26 +427,21 @@ def cmd_post():
         return
     with open(PENDING_FILE, "r", encoding="utf-8") as f:
         pending = json.load(f)
-
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     branch = os.environ.get("GITHUB_REF_NAME", "main")
     if not repo:
         print("❌ Нет GITHUB_REPOSITORY (запуск вне GitHub Actions).")
         return
     image_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{pending['image']}"
-
     try:
         channel_id = get_buffer_channel_id(token)
         ok, info = buffer_create_post(token, channel_id, pending["text"], image_url)
     except Exception as e:
         ok, info = False, str(e)
-
-    # Если Buffer говорит, что пост уже опубликован — считаем это успехом
     already_posted = "already got this one scheduled" in str(info) or "same thing twice" in str(info)
-
     if ok or already_posted:
         if already_posted:
-            print(f"⚠️ Этот пост уже был опубликован ранее в Buffer. Помечаем как обработанный.")
+            print(f"⚠️ Этот пост уже был опубликован ранее в Buffer.")
         else:
             print(f"✅ Твит опубликован через Buffer, id: {info}")
         history = load_history()
