@@ -11,7 +11,9 @@ BUFFER_API = "https://api.buffer.com"
 HISTORY_FILE = "threads_posted_history.json"
 BANNERS_DIR  = "banners"
 
-MAX_TEXT_LENGTH = 480   # 👈 Жёсткий лимит (с запасом от 500 символов Buffer)
+# 👇 Жёсткий лимит 250 символов. 
+# Threads/Buffer считает кириллицу "тяжелее", поэтому 450 символов пробивали их лимит в 500.
+MAX_TEXT_LENGTH = 250   
 TOPIC_TAG = "Испания"
 # =================================================
 
@@ -115,9 +117,9 @@ def get_available_banner_ids():
 # ---------- Форматирование текста для Threads ----------
 def build_threads_text(title_raw, full_text):
     """
-    Заголовок + первые 2-3 предложения тела.
-    ЖЁСТКАЯ обрезка по len() до MAX_TEXT_LENGTH (480 символов),
-    чтобы гарантированно пройти проверку Buffer (лимит 500).
+    Заголовок + первые предложения тела.
+    Жёсткая обрезка по len() до MAX_TEXT_LENGTH (250 символов),
+    чтобы гарантированно пройти внутреннюю проверку Buffer/Threads.
     """
     title = title_raw.strip()
 
@@ -151,11 +153,11 @@ def build_threads_text(title_raw, full_text):
     sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
     sentences = [s for s in sentences if 'читать оригинал' not in s.lower()]
 
-    # Обрезаем заголовок по len() до 150 символов
-    if len(title) > 150:
-        title = title[:147] + "…"
+    # Обрезаем заголовок по len() до 120 символов
+    if len(title) > 120:
+        title = title[:117] + "…"
 
-    # 👇 ЖЁСТКАЯ обрезка: пытаемся добавить предложения, пока не упёрлись в лимит
+    # Пытаемся добавить предложения, пока не упёрлись в лимит 250
     body = ""
     for sent in sentences[:3]:
         test_body = (body + " " + sent) if body else sent
@@ -165,18 +167,11 @@ def build_threads_text(title_raw, full_text):
         else:
             break
 
-    # Если даже без предложений уже превышает — обрезаем тело посимвольно
     result = f"{title}\n\n{body}" if body else title
     
+    # Финальная страховка: если всё равно длиннее 250, обрезаем посимвольно
     if len(result) > MAX_TEXT_LENGTH:
-        # Оставляем место для "…"
-        max_body_len = MAX_TEXT_LENGTH - len(title) - 3  # 3 = "\n\n" + "…"
-        if max_body_len > 0 and body:
-            body = body[:max_body_len].rstrip() + "…"
-            result = f"{title}\n\n{body}"
-        else:
-            # Крайний случай: обрезаем сам заголовок
-            result = title[:MAX_TEXT_LENGTH-3] + "…"
+        result = result[:MAX_TEXT_LENGTH-3].rstrip() + "…"
 
     return result
 
