@@ -11,8 +11,8 @@ BUFFER_API = "https://api.buffer.com"
 HISTORY_FILE = "threads_posted_history.json"
 BANNERS_DIR  = "banners"
 
-MAX_TEXT_LENGTH = 500   # лимит Threads ~500 символов
-TOPIC_TAG = "Испания"   # 👈 топик ВЕРНУЛИ
+MAX_TEXT_LENGTH = 480   # 👈 Жёсткий лимит (с запасом от 500 символов Buffer)
+TOPIC_TAG = "Испания"
 # =================================================
 
 
@@ -113,20 +113,12 @@ def get_available_banner_ids():
 
 
 # ---------- Форматирование текста для Threads ----------
-def tweet_len(text):
-    """Подсчёт длины текста с учётом эмодзи"""
-    n = 0
-    for ch in text:
-        o = ord(ch)
-        if o >= 0x1000 or 0x2600 <= o <= 0x27BF or 0x2B00 <= o <= 0x2BFF or 0xFE00 <= o <= 0xFE0F:
-            n += 2
-        else:
-            n += 1
-    return n
-
-
 def build_threads_text(title_raw, full_text):
-    """Заголовок + первые 2-3 предложения тела (без дублей и без «Читать оригинал»)"""
+    """
+    Заголовок + первые 2-3 предложения тела.
+    ЖЁСТКАЯ обрезка по len() до MAX_TEXT_LENGTH (480 символов),
+    чтобы гарантированно пройти проверку Buffer (лимит 500).
+    """
     title = title_raw.strip()
 
     # Чистим текст: убираем хештеги и ссылки
@@ -135,16 +127,15 @@ def build_threads_text(title_raw, full_text):
     clean_text = re.sub(r'https?://\S+', '', clean_text)
     clean_text = re.sub(r'(?<!\w)t\.me/\S+', '', clean_text)
 
-    # 👇 Убираем строки-рудименты: «🔗 Читать оригинал (El País)»
-    # и строки, состоящие только из эмодзи (одинокий 🔗 и т.п.)
+    # Убираем строки-рудименты: «🔗 Читать оригинал (El País)»
     lines = []
     for line in clean_text.split('\n'):
         s = line.strip()
         if not s:
-            lines.append('')
             continue
         if 'читать оригинал' in s.lower():
             continue
+        # Строки только из эмодзи
         if re.fullmatch(r'[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF\U0000FE0F\U0000200D\s]+', s):
             continue
         lines.append(s)
@@ -158,31 +149,36 @@ def build_threads_text(title_raw, full_text):
     # Разбиваем на предложения
     sentences = re.split(r'(?<=[.!?…])\s+', body_src)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
-    # Страховка: отбрасываем предложения с «читать оригинал», если вдруг проскочили
     sentences = [s for s in sentences if 'читать оригинал' not in s.lower()]
 
-    # Берём первые 2-3 предложения (не более ~300 символов)
-    body = ""
-    for sent in sentences[:3]:
-        if tweet_len(body + " " + sent) < 300:
-            body += (" " if body else "") + sent
-
-    # Страховка от дубля заголовка
-    if body.startswith(title):
-        body = body[len(title):].strip()
-
-    # Обрезаем заголовок, если слишком длинный
-    if tweet_len(title) > 150:
+    # Обрезаем заголовок по len() до 150 символов
+    if len(title) > 150:
         title = title[:147] + "…"
 
-    # Обрезаем тело под лимит Threads
-    available = MAX_TEXT_LENGTH - tweet_len(title) - 10
-    if tweet_len(body) > available:
-        body = body[:max(available - 3, 0)].rstrip() + "…"
+    # 👇 ЖЁСТКАЯ обрезка: пытаемся добавить предложения, пока не упёрлись в лимит
+    body = ""
+    for sent in sentences[:3]:
+        test_body = (body + " " + sent) if body else sent
+        full_candidate = f"{title}\n\n{test_body}"
+        if len(full_candidate) <= MAX_TEXT_LENGTH:
+            body = test_body
+        else:
+            break
 
-    if body:
-        return f"{title}\n\n{body}"
-    return title
+    # Если даже без предложений уже превышает — обрезаем тело посимвольно
+    result = f"{title}\n\n{body}" if body else title
+    
+    if len(result) > MAX_TEXT_LENGTH:
+        # Оставляем место для "…"
+        max_body_len = MAX_TEXT_LENGTH - len(title) - 3  # 3 = "\n\n" + "…"
+        if max_body_len > 0 and body:
+            body = body[:max_body_len].rstrip() + "…"
+            result = f"{title}\n\n{body}"
+        else:
+            # Крайний случай: обрезаем сам заголовок
+            result = title[:MAX_TEXT_LENGTH-3] + "…"
+
+    return result
 
 
 # ---------- Buffer API ----------
@@ -317,7 +313,7 @@ def main():
     main_text  = build_threads_text(news['title_raw'], news['full_text'])
     reply_text = f"Читать в телеграм 👉 {news['link']}"
 
-    print(f"📝 Основной текст:\n{main_text}\n")
+    print(f"📝 Основной текст ({len(main_text)} символов):\n{main_text}\n")
     print(f"💬 Комментарий (reply):\n{reply_text}\n")
     print(f"🏷️ Топик: {TOPIC_TAG}\n")
 
