@@ -1,4 +1,4 @@
-name: Generate News Queue
+name: Generate News Twitter
 
 on:
   workflow_dispatch:
@@ -11,15 +11,15 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-and-post:
     runs-on: ubuntu-latest
-    timeout-minutes: 20  # Увеличен, т.к. теперь может генерить много баннеров
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # Обязательно для корректной работы git pull --rebase
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,22 +37,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run queue generator
+      - name: Generate banners, commit, and post to Buffer
         run: python main.py generate
         env:
           PYTHONUNBUFFERED: '1'
           BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
 
-      - name: Commit and Push changes
+      - name: Safety Commit and Push (подстраховка)
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git fetch origin main
           git add -A
           if ! git diff --cached --quiet; then
+            echo "⚠️ Скрипт не запушил изменения, делаем это вручную..."
             git commit -m "Update queue & banners [skip ci]"
             git pull --rebase --autostash origin main || true
             git push
           else
-            echo "Нет изменений для коммита."
+            echo "✅ Все изменения уже были успешно закоммичены и запушены скриптом main.py"
           fi
