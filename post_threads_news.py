@@ -208,7 +208,7 @@ def buffer_schedule_threads_post(token, channel_id, main_text, reply_text, image
     text: {text_lit},
     channelId: {ch_lit},
     schedulingType: automatic,
-    mode: shareAt,
+    mode: custom,
     scheduledAt: {scheduled_lit},
     metadata: {{
       threads: {{
