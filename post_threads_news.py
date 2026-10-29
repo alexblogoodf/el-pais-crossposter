@@ -1,7 +1,9 @@
 import os
 import re
 import json
+import random
 import requests
+from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 
 # ================== НАСТРОЙКИ ==================
@@ -11,10 +13,12 @@ BUFFER_API = "https://api.buffer.com"
 HISTORY_FILE = "threads_posted_history.json"
 BANNERS_DIR  = "banners"
 
-# 👇 Жёсткий лимит 250 символов. 
-# Threads/Buffer считает кириллицу "тяжелее", поэтому 450 символов пробивали их лимит в 500.
-MAX_TEXT_LENGTH = 250   
+MAX_TEXT_LENGTH = 250   # лимит Threads ~500, но с запасом для кириллицы
 TOPIC_TAG = "Испания"
+
+# 👇 Случайный интервал между постами: от 2 до 4 минут
+MIN_INTERVAL_MINUTES = 2
+MAX_INTERVAL_MINUTES = 4
 # =================================================
 
 
@@ -26,7 +30,7 @@ def load_history():
                 return json.load(f)
         except Exception as e:
             print(f"⚠️ Не удалось прочитать историю: {e}")
-    return {"posted": [], "cache_counter": 1}
+    return {"posted": [], "cache_counter": 1, "last_scheduled_at": None}
 
 
 def save_history(h):
@@ -36,7 +40,6 @@ def save_history(h):
 
 # ---------- Парсинг RSS ----------
 def extract_post_id(link):
-    """Извлекает номер поста из ссылки: https://t.me/elpaisru/107 -> 107 (как int)"""
     raw = link.rstrip("/").split("/")[-1].split("?")[0].split("#")[0]
     try:
         return int(raw)
@@ -67,7 +70,6 @@ def parse_text_div(text_div, link):
 
 
 def fetch_all_rss_news(cache_counter):
-    """Возвращает словарь {int_ID: {title_raw, full_text, link}} всех постов из RSS"""
     bridge_url = f"{BRIDGE_URL}&_cache_timeout={cache_counter}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
@@ -102,7 +104,6 @@ def fetch_all_rss_news(cache_counter):
 
 
 def get_available_banner_ids():
-    """Возвращает список int-номеров баннеров из папки banners/"""
     if not os.path.isdir(BANNERS_DIR):
         print(f"❌ Папка {BANNERS_DIR} не найдена.")
         return []
@@ -116,20 +117,13 @@ def get_available_banner_ids():
 
 # ---------- Форматирование текста для Threads ----------
 def build_threads_text(title_raw, full_text):
-    """
-    Заголовок + первые предложения тела.
-    Жёсткая обрезка по len() до MAX_TEXT_LENGTH (250 символов),
-    чтобы гарантированно пройти внутреннюю проверку Buffer/Threads.
-    """
     title = title_raw.strip()
 
-    # Чистим текст: убираем хештеги и ссылки
     clean_text = full_text
     clean_text = re.sub(r'#[^\s#]+', '', clean_text)
     clean_text = re.sub(r'https?://\S+', '', clean_text)
     clean_text = re.sub(r'(?<!\w)t\.me/\S+', '', clean_text)
 
-    # Убираем строки-рудименты: «🔗 Читать оригинал (El País)»
     lines = []
     for line in clean_text.split('\n'):
         s = line.strip()
@@ -137,27 +131,22 @@ def build_threads_text(title_raw, full_text):
             continue
         if 'читать оригинал' in s.lower():
             continue
-        # Строки только из эмодзи
         if re.fullmatch(r'[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF\U0000FE0F\U0000200D\s]+', s):
             continue
         lines.append(s)
     clean_text = '\n'.join(lines)
 
-    # Срезаем заголовок из начала текста, чтобы не дублировать
     body_src = clean_text.strip()
     if title and body_src.startswith(title):
         body_src = body_src[len(title):].strip()
 
-    # Разбиваем на предложения
     sentences = re.split(r'(?<=[.!?…])\s+', body_src)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
     sentences = [s for s in sentences if 'читать оригинал' not in s.lower()]
 
-    # Обрезаем заголовок по len() до 120 символов
     if len(title) > 120:
         title = title[:117] + "…"
 
-    # Пытаемся добавить предложения, пока не упёрлись в лимит 250
     body = ""
     for sent in sentences[:3]:
         test_body = (body + " " + sent) if body else sent
@@ -169,7 +158,6 @@ def build_threads_text(title_raw, full_text):
 
     result = f"{title}\n\n{body}" if body else title
     
-    # Финальная страховка: если всё равно длиннее 250, обрезаем посимвольно
     if len(result) > MAX_TEXT_LENGTH:
         result = result[:MAX_TEXT_LENGTH-3].rstrip() + "…"
 
@@ -205,20 +193,23 @@ def get_threads_channel_id(token):
     raise Exception("К Buffer не подключен Threads-канал")
 
 
-def buffer_create_threads_post_with_reply(token, channel_id, main_text, reply_text, image_url, topic_tag):
-    """Создаёт тред: основной пост (с топиком и картинкой) + первый комментарий (reply)"""
+def buffer_schedule_threads_post(token, channel_id, main_text, reply_text, image_url, topic_tag, scheduled_at):
+    """Планирует тред (основной пост + reply) на конкретное время через shareAt"""
     text_lit  = json.dumps(main_text, ensure_ascii=False)
     reply_lit = json.dumps(reply_text, ensure_ascii=False)
     ch_lit    = json.dumps(channel_id)
     url_lit   = json.dumps(image_url)
     topic_lit = json.dumps(topic_tag, ensure_ascii=False)
+    scheduled_iso = scheduled_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    scheduled_lit = json.dumps(scheduled_iso)
 
     query = f'''mutation {{
   createPost(input: {{
     text: {text_lit},
     channelId: {ch_lit},
     schedulingType: automatic,
-    mode: shareNow,
+    mode: shareAt,
+    scheduledAt: {scheduled_lit},
     metadata: {{
       threads: {{
         topic: {topic_lit},
@@ -241,18 +232,16 @@ def buffer_create_threads_post_with_reply(token, channel_id, main_text, reply_te
     data = buffer_graphql(token, query)
     res = data.get("createPost", {})
     if res.get("post"):
-        post = res["post"]
-        status = post.get("status")
-        due_at = post.get("dueAt")
-        print(f"📊 Статус поста в Buffer: {status}")
-        if due_at:
-            print(f"📅 Запланирован на: {due_at}")
-        return True, post.get("id")
+        return True, res["post"].get("id")
     return False, res.get("message", "неизвестная ошибка Buffer")
 
 
 # ---------- Главный сценарий ----------
 def main():
+    print("=" * 60)
+    print("🚀 Запуск генерации очереди Threads-постов")
+    print("=" * 60)
+
     token = os.environ.get("BUFFER_API_KEY", "")
     if not token:
         print("⚠️ BUFFER_API_KEY не задан в секретах — выходим.")
@@ -263,6 +252,20 @@ def main():
 
     history    = load_history()
     posted_ids = set(history.get("posted", []))
+    last_scheduled_str = history.get("last_scheduled_at")
+
+    # Парсим время последнего запланированного поста
+    now = datetime.now(timezone.utc)
+    if last_scheduled_str:
+        try:
+            last_scheduled = datetime.fromisoformat(last_scheduled_str.replace("Z", "+00:00"))
+        except Exception:
+            last_scheduled = now
+    else:
+        last_scheduled = now
+
+    print(f"🕐 Текущее время (UTC): {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📅 Последний запланированный Threads-пост: {last_scheduled.strftime('%Y-%m-%d %H:%M:%S')}")
 
     cache_counter = history.get("cache_counter", 1)
     rss_news = fetch_all_rss_news(cache_counter)
@@ -286,6 +289,7 @@ def main():
         except ValueError:
             pass
 
+    # Кандидаты: (есть в RSS) И (есть баннер) И (не запощено) — от старых к новым
     candidates = sorted(list((rss_ids & banner_ids) - posted_int_ids))
 
     print(f"📊 Пересечение (RSS ∩ баннеры): {sorted(rss_ids & banner_ids)}")
@@ -297,46 +301,76 @@ def main():
         save_history(history)
         return
 
-    target_id = candidates[0]
-    target_str = str(target_id)
-    banner_path = f"{BANNERS_DIR}/{target_str}.jpg"
-    news = rss_news[target_id]
-
-    print(f"\n🎯 Публикуем баннер: {banner_path}")
-    print(f"📝 Заголовок: {news['title_raw']}")
-
-    main_text  = build_threads_text(news['title_raw'], news['full_text'])
-    reply_text = f"Читать в телеграм 👉 {news['link']}"
-
-    print(f"📝 Основной текст ({len(main_text)} символов):\n{main_text}\n")
-    print(f"💬 Комментарий (reply):\n{reply_text}\n")
-    print(f"🏷️ Топик: {TOPIC_TAG}\n")
+    # Получаем ID канала Buffer
+    try:
+        channel_id = get_threads_channel_id(token)
+    except Exception as e:
+        print(f"❌ Ошибка получения канала: {e}")
+        save_history(history)
+        return
 
     repo   = os.environ.get("GITHUB_REPOSITORY", "")
     branch = os.environ.get("GITHUB_REF_NAME", "main")
-    image_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{banner_path}"
-    print(f"🖼 Картинка: {image_url}")
 
-    try:
-        channel_id = get_threads_channel_id(token)
-        ok, info = buffer_create_threads_post_with_reply(token, channel_id, main_text, reply_text, image_url, TOPIC_TAG)
-    except Exception as e:
-        ok, info = False, str(e)
+    # Текущий слот — отталкиваемся от max(сейчас, last_scheduled + мин. интервал)
+    current_slot = max(now, last_scheduled + timedelta(minutes=MIN_INTERVAL_MINUTES))
 
-    already = ("already got this one scheduled" in str(info)
-               or "same thing twice" in str(info))
+    scheduled_posts = []
+    new_last_scheduled = last_scheduled
 
-    if ok or already:
-        if already:
-            print("⚠️ Buffer сообщает, что пост уже запланирован. Помечаем как запощенный.")
-        else:
-            print(f"✅ Пост принят Buffer, id: {info}")
-        posted_ids.add(target_str)
+    # Планируем каждого кандидата со случайным интервалом
+    for target_id in candidates:
+        # Случайный интервал от MIN до MAX минут
+        interval_seconds = random.randint(MIN_INTERVAL_MINUTES * 60, MAX_INTERVAL_MINUTES * 60)
+        current_slot = current_slot + timedelta(seconds=interval_seconds)
+
+        target_str = str(target_id)
+        banner_path = f"{BANNERS_DIR}/{target_str}.jpg"
+        news = rss_news[target_id]
+
+        print(f"\n🎯 Готовим баннер: {banner_path}")
+        print(f"📝 Заголовок: {news['title_raw']}")
+
+        main_text  = build_threads_text(news['title_raw'], news['full_text'])
+        reply_text = f"Читать в телеграм 👉 {news['link']}"
+        image_url  = f"https://raw.githubusercontent.com/{repo}/{branch}/{banner_path}"
+
+        print(f"📝 Текст ({len(main_text)} симв.)")
+        print(f"🕐 Планируем на: {current_slot.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+
+        try:
+            ok, info = buffer_schedule_threads_post(
+                token, channel_id, main_text, reply_text,
+                image_url, TOPIC_TAG, current_slot
+            )
+            if ok:
+                print(f"✅ Запланировано (Buffer id: {info})")
+                scheduled_posts.append(target_str)
+                new_last_scheduled = current_slot
+            else:
+                print(f"❌ Ошибка планирования: {info}")
+        except Exception as e:
+            print(f"❌ Исключение: {e}")
+            continue
+
+        # Небольшая задержка между запросами к Buffer
+        import time
+        time.sleep(1)
+
+    # Обновляем историю
+    if scheduled_posts:
+        for pid in scheduled_posts:
+            posted_ids.add(pid)
         history["posted"] = sorted(list(posted_ids))[-500:]
-        save_history(history)
-        print("💾 История обновлена.")
+        history["last_scheduled_at"] = new_last_scheduled.strftime("%Y-%m-%dT%H:%M:%SZ")
+        print(f"\n📦 Запланировано {len(scheduled_posts)} Threads-постов в очередь Buffer")
+        print(f"🕐 Последний пост в очереди: {new_last_scheduled.strftime('%Y-%m-%d %H:%M:%S')} UTC")
     else:
-        print(f"❌ Buffer не опубликовал: {info}. Повторим в следующем запуске.")
+        print("\n⚠️ Ни один пост не был запланирован")
+
+    save_history(history)
+    print("💾 История обновлена.")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
