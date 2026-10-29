@@ -3,15 +3,22 @@ name: Instagram News (Buffer)
 on:
   workflow_dispatch:
 
+# 👇 Блокировка одновременных запусков всех workflow в этом репозитории
+concurrency:
+  group: el-pais-crossposter
+  cancel-in-progress: false
+
 jobs:
   post-instagram:
     runs-on: ubuntu-latest
     permissions:
-      contents: write         # чтобы коммитить историю обратно
+      contents: write
 
     steps:
       - name: Скачиваем репозиторий (с папкой banners)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 👈 нужно для корректной работы git pull --rebase
 
       - name: Устанавливаем Python
         uses: actions/setup-python@v5
@@ -30,10 +37,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
           git add instagram_posted_history.json
           if ! git diff --cached --quiet; then
             git commit -m "Update Instagram history [skip ci]"
-            git pull --rebase --autostash || true
+            git pull --rebase --autostash origin main || true
             git push
           else
             echo "История не изменилась — коммит не нужен."
