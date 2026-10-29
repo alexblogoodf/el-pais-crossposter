@@ -1,7 +1,10 @@
 import os
 import re
 import json
+import random
+import time
 import requests
+from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 
 # ================== НАСТРОЙКИ ==================
@@ -13,6 +16,11 @@ BANNERS_DIR  = "banners"
 
 MAX_CAPTION   = 2100
 DEFAULT_TAGS = ["#новости", "#эльпаис", "#Испания", "#ElPais", "#España"]
+
+# 👇 Случайный интервал между постами: от 5 до 10 минут
+# (Instagram строже к большим объёмам, чем Threads)
+MIN_INTERVAL_MINUTES = 5
+MAX_INTERVAL_MINUTES = 10
 # =================================================
 
 
@@ -24,7 +32,7 @@ def load_history():
                 return json.load(f)
         except Exception as e:
             print(f"⚠️ Не удалось прочитать историю: {e}")
-    return {"posted": [], "cache_counter": 1}
+    return {"posted": [], "cache_counter": 1, "last_scheduled_at": None}
 
 
 def save_history(h):
@@ -34,7 +42,6 @@ def save_history(h):
 
 # ---------- Парсинг RSS ----------
 def extract_post_id(link):
-    """Извлекает номер поста из ссылки: https://t.me/elpaisru/107 -> 107 (как int)"""
     raw = link.rstrip("/").split("/")[-1].split("?")[0].split("#")[0]
     try:
         return int(raw)
@@ -70,7 +77,6 @@ def parse_text_div(text_div, link):
 
 
 def fetch_all_rss_news(cache_counter):
-    """Возвращает словарь {int_ID: {title, hashtags, full_text, link}} всех постов из RSS"""
     bridge_url = f"{BRIDGE_URL}&_cache_timeout={cache_counter}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
@@ -105,7 +111,6 @@ def fetch_all_rss_news(cache_counter):
 
 
 def get_available_banner_ids():
-    """Возвращает список int-номеров баннеров из папки banners/"""
     if not os.path.isdir(BANNERS_DIR):
         print(f"❌ Папка {BANNERS_DIR} не найдена.")
         return []
@@ -123,24 +128,19 @@ def build_caption(news):
     hashtags = news["hashtags"]
     body     = news["full_text"]
 
-    # Убираем хештеги из тела
     for h in hashtags:
         body = body.replace(h, '')
     
-    # Убираем ссылки на телеграм и elpais.com
     body = re.sub(r'https?://t\.me/\S+', '', body)
     body = re.sub(r'https?://elpais\.com/\S+', '', body)
     body = re.sub(r'(?<!\w)t\.me/\S+', '', body)
     
-    # Фильтруем строки
     lines = []
     for line in body.split('\n'):
         s = line.strip()
-        # Пропускаем строки с "читать в телеграм" или "читать оригинал"
         s_lower = s.lower()
         if 'читать в телеграм' in s_lower or 'читать оригинал' in s_lower:
             continue
-        # Пропускаем строки, которые содержат только эмодзи (например, 🔗)
         if not s or re.match(r'^[\U0001F000-\U0001FFFF\U00002600-\U000027BF\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002702-\U000027B0\U000024C2-\U0001F251\U0001F300-\U0001F5FF\U0001F600-\U0001F64F\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]+$', s):
             continue
         lines.append(s)
@@ -207,16 +207,21 @@ def get_instagram_channel_id(token):
     raise Exception("К Buffer не подключен Instagram-канал")
 
 
-def buffer_create_instagram_post(token, channel_id, text, image_url):
+def buffer_schedule_instagram_post(token, channel_id, text, image_url, scheduled_at):
+    """Планирует Instagram-пост на конкретное время через shareAt"""
     text_lit = json.dumps(text, ensure_ascii=False)
     ch_lit   = json.dumps(channel_id)
     url_lit  = json.dumps(image_url)
+    scheduled_iso = scheduled_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    scheduled_lit = json.dumps(scheduled_iso)
+
     query = f'''mutation {{
   createPost(input: {{
     text: {text_lit},
     channelId: {ch_lit},
     schedulingType: automatic,
-    mode: shareNow,
+    mode: shareAt,
+    scheduledAt: {scheduled_lit},
     assets: [{{ image: {{ url: {url_lit} }} }}],
     metadata: {{
       instagram: {{
@@ -238,6 +243,10 @@ def buffer_create_instagram_post(token, channel_id, text, image_url):
 
 # ---------- Главный сценарий ----------
 def main():
+    print("=" * 60)
+    print("🚀 Запуск генерации очереди Instagram-постов")
+    print("=" * 60)
+
     token = os.environ.get("BUFFER_API_KEY", "")
     if not token:
         print("⚠️ BUFFER_API_KEY не задан в секретах — выходим.")
@@ -248,8 +257,22 @@ def main():
 
     history    = load_history()
     posted_ids = set(history.get("posted", []))
+    last_scheduled_str = history.get("last_scheduled_at")
 
-    # 1. Получаем все новости из RSS (ключи — INT)
+    # Парсим время последнего запланированного поста
+    now = datetime.now(timezone.utc)
+    if last_scheduled_str:
+        try:
+            last_scheduled = datetime.fromisoformat(last_scheduled_str.replace("Z", "+00:00"))
+        except Exception:
+            last_scheduled = now
+    else:
+        last_scheduled = now
+
+    print(f"🕐 Текущее время (UTC): {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📅 Последний запланированный Instagram-пост: {last_scheduled.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # 1. Получаем все новости из RSS
     cache_counter = history.get("cache_counter", 1)
     rss_news = fetch_all_rss_news(cache_counter)
     history["cache_counter"] = cache_counter + 1
@@ -262,11 +285,11 @@ def main():
     rss_ids = set(rss_news.keys())
     print(f"📋 Доступно в RSS (int): {sorted(rss_ids)}")
 
-    # 2. Получаем все готовые баннеры (INT)
+    # 2. Получаем готовые баннеры
     banner_ids = set(get_available_banner_ids())
     print(f"🖼 Доступно баннеров (int): {sorted(banner_ids)}")
 
-    # 3. Приводим posted_ids к INT для корректного сравнения
+    # 3. Приводим posted_ids к INT
     posted_int_ids = set()
     for pid in posted_ids:
         try:
@@ -274,7 +297,7 @@ def main():
         except ValueError:
             pass
 
-    # 4. Находим пересечение: (есть в RSS) И (есть баннер) И (не запощено)
+    # 4. Находим кандидатов
     candidates = sorted(list((rss_ids & banner_ids) - posted_int_ids))
 
     print(f"📊 Пересечение (RSS ∩ баннеры): {sorted(rss_ids & banner_ids)}")
@@ -286,43 +309,69 @@ def main():
         save_history(history)
         return
 
-    # Берём самый ранний
-    target_id = candidates[0]
-    target_str = str(target_id)
-    banner_path = f"{BANNERS_DIR}/{target_str}.jpg"
-    news = rss_news[target_id]
-
-    print(f"\n🎯 Публикуем баннер: {banner_path}")
-    print(f"📝 Заголовок: {news['title']}")
-
-    caption = build_caption(news)
-    print(f"📝 Подпись:\n{caption}\n")
+    # Получаем ID канала Buffer
+    try:
+        channel_id = get_instagram_channel_id(token)
+    except Exception as e:
+        print(f"❌ Ошибка получения канала: {e}")
+        save_history(history)
+        return
 
     repo   = os.environ.get("GITHUB_REPOSITORY", "")
     branch = os.environ.get("GITHUB_REF_NAME", "main")
-    image_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{banner_path}"
-    print(f"🖼 Картинка: {image_url}")
 
-    try:
-        channel_id = get_instagram_channel_id(token)
-        ok, info = buffer_create_instagram_post(token, channel_id, caption, image_url)
-    except Exception as e:
-        ok, info = False, str(e)
+    # Стартовый слот: max(сейчас, last_scheduled + мин. интервал)
+    current_slot = max(now, last_scheduled + timedelta(minutes=MIN_INTERVAL_MINUTES))
 
-    already = ("already got this one scheduled" in str(info)
-               or "same thing twice" in str(info))
+    scheduled_posts = []
+    new_last_scheduled = last_scheduled
 
-    if ok or already:
-        if already:
-            print("⚠️ Buffer сообщает, что пост уже запланирован. Помечаем как запощенный.")
-        else:
-            print(f"✅ Пост принят Buffer, id: {info}")
-        posted_ids.add(target_str)
+    # Планируем каждого кандидата со случайным интервалом 5-10 минут
+    for target_id in candidates:
+        interval_seconds = random.randint(MIN_INTERVAL_MINUTES * 60, MAX_INTERVAL_MINUTES * 60)
+        current_slot = current_slot + timedelta(seconds=interval_seconds)
+
+        target_str = str(target_id)
+        banner_path = f"{BANNERS_DIR}/{target_str}.jpg"
+        news = rss_news[target_id]
+
+        print(f"\n🎯 Готовим баннер: {banner_path}")
+        print(f"📝 Заголовок: {news['title']}")
+
+        caption = build_caption(news)
+        image_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{banner_path}"
+
+        print(f"🕐 Планируем на: {current_slot.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+
+        try:
+            ok, info = buffer_schedule_instagram_post(token, channel_id, caption, image_url, current_slot)
+            if ok:
+                print(f"✅ Запланировано (Buffer id: {info})")
+                scheduled_posts.append(target_str)
+                new_last_scheduled = current_slot
+            else:
+                print(f"❌ Ошибка планирования: {info}")
+        except Exception as e:
+            print(f"❌ Исключение: {e}")
+            continue
+
+        # Небольшая задержка между запросами к Buffer
+        time.sleep(1)
+
+    # Обновляем историю
+    if scheduled_posts:
+        for pid in scheduled_posts:
+            posted_ids.add(pid)
         history["posted"] = sorted(list(posted_ids))[-500:]
-        save_history(history)
-        print("💾 История обновлена.")
+        history["last_scheduled_at"] = new_last_scheduled.strftime("%Y-%m-%dT%H:%M:%SZ")
+        print(f"\n📦 Запланировано {len(scheduled_posts)} Instagram-постов в очередь Buffer")
+        print(f"🕐 Последний пост в очереди: {new_last_scheduled.strftime('%Y-%m-%d %H:%M:%S')} UTC")
     else:
-        print(f"❌ Buffer не опубликовал: {info}. Повторим в следующем запуске.")
+        print("\n⚠️ Ни один пост не был запланирован")
+
+    save_history(history)
+    print("💾 История обновлена.")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
