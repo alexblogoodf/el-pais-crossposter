@@ -208,20 +208,20 @@ def get_instagram_channel_id(token):
 
 
 def buffer_schedule_instagram_post(token, channel_id, text, image_url, scheduled_at):
-    """Планирует Instagram-пост на конкретное время через shareAt"""
+    """Планирует Instagram-пост на конкретное время через customScheduled + dueAt"""
     text_lit = json.dumps(text, ensure_ascii=False)
     ch_lit   = json.dumps(channel_id)
     url_lit  = json.dumps(image_url)
-    scheduled_iso = scheduled_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-    scheduled_lit = json.dumps(scheduled_iso)
+    # 👇 Формат ISO 8601 с миллисекундами, как в документации Buffer
+    due_lit = json.dumps(scheduled_at.strftime("%Y-%m-%dT%H:%M:%S.000Z"))
 
     query = f'''mutation {{
   createPost(input: {{
     text: {text_lit},
     channelId: {ch_lit},
     schedulingType: automatic,
-    mode: custom,
-    scheduledAt: {scheduled_lit},
+    mode: customScheduled,
+    dueAt: {due_lit},
     assets: [{{ image: {{ url: {url_lit} }} }}],
     metadata: {{
       instagram: {{
