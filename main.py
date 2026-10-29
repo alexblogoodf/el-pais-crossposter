@@ -4,24 +4,27 @@ import sys
 import json
 import time
 import requests
+from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import cairosvg
 
 BRIDGE_URL = "https://rss-bridge.org/bridge01/?action=display&username=elpaisru&bridge=TelegramBridge&format=Html"
 HISTORY_FILE = "posted_history.json"
-PENDING_FILE = "pending_tweet.json"
 BUFFER_API = "https://api.buffer.com"
 
-# 🖼️ Маппинг ключевых слов → fallback-картинки
+# Интервал между постами в очереди Buffer
+POST_INTERVAL_MINUTES = 2
+
 FALLBACK_IMAGES = {
     'people_with_flags.jpg': ['протест', 'митинг', 'демонстрация', 'акция', 'манифестация', 'pp', 'vox'],
     'government_building.jpg': ['правительство', 'парламент', 'закон', 'министр', 'санчес', 'конгресс', 'сенат', 'амнистия', 'депутат'],
     'police_officers.jpg': ['полиция', 'задержание', 'арест', 'миграция', 'мигрант', 'граница', 'сеута', 'мелилья', 'нелегал'],
     'city_life.jpg': ['мадрид', 'барселона', 'город', 'улица', 'район', 'валенси', 'севилья', 'малага'],
     'old_castle.jpg': ['история', 'культура', 'туризм', 'музей', 'собор', 'достопримечательность', 'архитектур'],
-    'Flag_of_Spain.jpg': []  # дефолт для всех новостей Испании
+    'Flag_of_Spain.jpg': []
 }
+
 
 def remove_emojis(text):
     emoji_pattern = re.compile(
@@ -44,6 +47,7 @@ def remove_emojis(text):
         "\u3030"
         "]+", flags=re.UNICODE)
     return emoji_pattern.sub(r'', text).strip()
+
 
 def get_all_posts_from_rss_bridge(cache_counter):
     bridge_url = f"{BRIDGE_URL}&_cache_timeout={cache_counter}"
@@ -109,6 +113,7 @@ def get_all_posts_from_rss_bridge(cache_counter):
 
     return posts
 
+
 def tweet_len(text):
     n = 0
     for ch in text:
@@ -118,6 +123,7 @@ def tweet_len(text):
         else:
             n += 1
     return n
+
 
 def build_tweet_text(title_raw, link, hashtags=None):
     mandatory = ["#новости", "#эльпаис"]
@@ -151,6 +157,7 @@ def build_tweet_text(title_raw, link, hashtags=None):
 
     return f"{title}{suffix}{link}{tags_line}"
 
+
 def select_fallback_image(title, text='', hashtags=None):
     combined_text = f"{title} {text} {' '.join(hashtags or [])}".lower()
     for img_name, keywords in FALLBACK_IMAGES.items():
@@ -168,6 +175,7 @@ def select_fallback_image(title, text='', hashtags=None):
         print(f"🖼️ Fallback по умолчанию: Flag_of_Spain.jpg")
         return default_img
     return None
+
 
 def generate_card(image_url, title_text, fallback_context=None, output_path="banner.jpg"):
     img = None
@@ -194,7 +202,7 @@ def generate_card(image_url, title_text, fallback_context=None, output_path="ban
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
                 img = Image.open("temp_src.jpg").convert("RGBA")
-                print("✅ Картинка успешно загружена из Telegram CDN")
+                print(f"✅ Картинка загружена из Telegram CDN → {output_path}")
                 break
             except (requests.exceptions.RequestException, IOError) as e:
                 print(f"⚠️ Ошибка загрузки (попытка {attempt+1}/3): {e}")
@@ -231,7 +239,6 @@ def generate_card(image_url, title_text, fallback_context=None, output_path="ban
     try:
         font = ImageFont.truetype("Exo2-Black.ttf", 56)
     except Exception:
-        print("⚠️ Шрифт Exo2-Black.ttf не найден, используется стандартный.")
         font = ImageFont.load_default()
 
     def get_wrapped_lines(text, font, max_width):
@@ -275,8 +282,6 @@ def generate_card(image_url, title_text, fallback_context=None, output_path="ban
             cairosvg.svg2png(url="logo.svg", write_to="logo_temp.png", output_width=320)
             logo = Image.open("logo_temp.png").convert("RGBA")
             img.paste(logo, (60, 60), logo)
-        else:
-            print("⚠️ Файл logo.svg не найден — картинка будет без логотипа.")
     except Exception as e:
         print(f"⚠️ Ошибка при добавлении логотипа: {e}")
 
@@ -291,6 +296,8 @@ def generate_card(image_url, title_text, fallback_context=None, output_path="ban
 
     return output_path
 
+
+# ---------- Buffer API ----------
 def buffer_graphql(token, query):
     r = requests.post(BUFFER_API,
                       headers={"Content-Type": "application/json",
@@ -301,6 +308,7 @@ def buffer_graphql(token, query):
     if data.get("errors"):
         raise Exception(f"GraphQL error: {data['errors']}")
     return data["data"]
+
 
 def get_buffer_channel_id(token):
     data = buffer_graphql(token, "query { account { organizations { id name } } }")
@@ -321,20 +329,26 @@ def get_buffer_channel_id(token):
 
     raise Exception("В Buffer не подключено ни одного канала")
 
-def buffer_create_post(token, channel_id, text, image_url):
+
+def buffer_schedule_post(token, channel_id, text, image_url, scheduled_at):
+    """Планирует пост на конкретное время через shareAt"""
     text_lit = json.dumps(text, ensure_ascii=False)
     ch_lit = json.dumps(channel_id)
     url_lit = json.dumps(image_url)
+    # ISO 8601 формат для Buffer
+    scheduled_iso = scheduled_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    scheduled_lit = json.dumps(scheduled_iso)
 
     query = f'''mutation {{
   createPost(input: {{
     text: {text_lit},
     channelId: {ch_lit},
     schedulingType: automatic,
-    mode: shareNow,
+    mode: shareAt,
+    scheduledAt: {scheduled_lit},
     assets: [{{ image: {{ url: {url_lit} }} }}]
   }}) {{
-    ... on PostActionSuccess {{ post {{ id text }} }}
+    ... on PostActionSuccess {{ post {{ id text dueAt }} }}
     ... on MutationError {{ message }}
   }}
 }}'''
@@ -345,6 +359,8 @@ def buffer_create_post(token, channel_id, text, image_url):
         return True, res["post"].get("id")
     return False, res.get("message", "неизвестная ошибка Buffer")
 
+
+# ---------- История ----------
 def load_history():
     if os.path.exists(HISTORY_FILE):
         try:
@@ -352,18 +368,52 @@ def load_history():
                 return json.load(f)
         except Exception as e:
             print(f"⚠️ Не удалось прочитать историю: {e}")
-    return {"processed": [], "cache_counter": 1}
+    return {"processed": [], "cache_counter": 1, "last_scheduled_at": None}
+
 
 def save_history(history):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
+
+# ---------- Главная логика ----------
 def cmd_generate():
-    print("Получаем новости из RSS-Bridge...")
+    print("=" * 60)
+    print("🚀 Запуск генерации очереди постов")
+    print("=" * 60)
+
+    token = os.environ.get("BUFFER_API_KEY", "")
+    if not token:
+        print("⚠️ BUFFER_API_KEY не задан — выходим.")
+        return
+    if not os.environ.get("GITHUB_REPOSITORY"):
+        print("❌ Нет GITHUB_REPOSITORY (запуск вне GitHub Actions).")
+        return
+
     history = load_history()
     processed = set(history.get("processed", []))
     cache_counter = history.get("cache_counter", 1)
+    last_scheduled_str = history.get("last_scheduled_at")
 
+    # Парсим время последнего запланированного поста
+    now = datetime.now(timezone.utc)
+    if last_scheduled_str:
+        try:
+            last_scheduled = datetime.fromisoformat(last_scheduled_str.replace("Z", "+00:00"))
+        except Exception:
+            last_scheduled = now
+    else:
+        last_scheduled = now
+
+    # Начинаем планирование от max(сейчас, last_scheduled + 2 минуты)
+    # Это защита: если прошлый запуск запланировал посты на будущее, не пересекаемся с ними
+    start_slot = max(now, last_scheduled + timedelta(minutes=POST_INTERVAL_MINUTES))
+    print(f"🕐 Текущее время (UTC): {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📅 Последний запланированный пост: {last_scheduled.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"▶️  Первый слот для новых постов: {start_slot.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # Получаем новости из RSS
+    print("\n📡 Получаем новости из RSS-Bridge...")
     posts = get_all_posts_from_rss_bridge(cache_counter)
     if not posts:
         print("❌ Не удалось получить новости.")
@@ -371,139 +421,115 @@ def cmd_generate():
         save_history(history)
         return
 
-    # 👇 Подробное логирование
     print(f"📋 Новостей в RSS: {len(posts)}")
-    rss_links = [p["link"] for p in posts]
-    print(f"🔗 Ссылки в RSS: {rss_links[:5]}...")  # первые 5
-    
-    already_processed = [link for link in rss_links if link in processed]
-    not_processed = [link for link in rss_links if link not in processed]
-    print(f"✅ Уже обработано: {len(already_processed)}")
-    print(f"🆕 Новых (не обработано): {len(not_processed)}")
-    if not_processed:
-        print(f"   Первые 3 новых: {not_processed[:3]}")
 
-    latest = posts[0]
-    generate_card(
-        latest["image_url"],
-        latest["title_clean"],
-        fallback_context={
-            'title': latest.get('title_raw', ''),
-            'text': '',
-            'hashtags': latest.get('hashtags', [])
-        },
-        output_path="banner.jpg"
-    )
-    print("🎨 banner.jpg (последняя новость) создан.")
+    # Находим новые посты (не в истории) — от старых к новым
+    new_posts = [p for p in reversed(posts) if p["link"] not in processed]
+    print(f"🆕 Новых (не в истории): {len(new_posts)}")
 
-    first_run = len(processed) == 0
+    if not new_posts:
+        print("😴 Все новости из RSS уже запланированы или опубликованы.")
+        history["cache_counter"] = cache_counter + 1
+        save_history(history)
+        return
 
-    if first_run:
-        to_post = posts[0]
-        for p in posts[1:]:
-            processed.add(p["link"])
-        print("🆕 Первый запуск: старые новости помечены пропущенными.")
-    else:
-        unposted = [p for p in reversed(posts) if p["link"] not in processed]
-        
-        if not unposted:
-            print("😴 Все новости из RSS уже обработаны. Возможно, RSS отдаёт только старые посты.")
-            print(f"💡 Попробуйте увеличить cache_counter или подождать новых постов в канале.")
-            history["cache_counter"] = cache_counter + 1
-            save_history(history)
-            return
-            
-        to_post = unposted[0]
+    # Получаем ID канала Buffer
+    try:
+        channel_id = get_buffer_channel_id(token)
+        print(f"📡 X-канал Buffer: {channel_id}")
+    except Exception as e:
+        print(f"❌ Ошибка получения канала: {e}")
+        return
 
-    if to_post:
-        post_id = to_post["link"].rstrip("/").split("/")[-1]
-        os.makedirs("banners", exist_ok=True)
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    branch = os.environ.get("GITHUB_REF_NAME", "main")
+
+    os.makedirs("banners", exist_ok=True)
+
+    # Планируем каждый пост с интервалом 2 минуты
+    scheduled_posts = []
+    new_last_scheduled = last_scheduled
+
+    for i, post in enumerate(new_posts):
+        post_id = post["link"].rstrip("/").split("/")[-1]
         img_name = f"banners/{post_id}.jpg"
 
+        # Генерируем баннер
+        print(f"\n🎨 Генерируем баннер для {post_id}: {post['title_clean'][:60]}...")
         generate_card(
-            to_post["image_url"],
-            to_post["title_clean"],
+            post["image_url"],
+            post["title_clean"],
             fallback_context={
-                'title': to_post.get('title_raw', ''),
+                'title': post.get('title_raw', ''),
                 'text': '',
-                'hashtags': to_post.get('hashtags', [])
+                'hashtags': post.get('hashtags', [])
             },
             output_path=img_name
         )
 
-        with open(PENDING_FILE, "w", encoding="utf-8") as f:
-            json.dump({"link": to_post["link"],
-                       "text": build_tweet_text(to_post["title_raw"], to_post["link"],
-                                                to_post.get("hashtags", [])),
-                       "image": img_name}, f, ensure_ascii=False, indent=2)
+        # Формируем текст твита
+        tweet_text = build_tweet_text(post["title_raw"], post["link"], post.get("hashtags", []))
+        image_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{img_name}"
 
-        print(f"📦 Подготовлен твит: {to_post['link']}")
+        # Вычисляем время публикации
+        scheduled_time = start_slot + timedelta(minutes=POST_INTERVAL_MINUTES * i)
+
+        # Отправляем в Buffer
+        try:
+            ok, info = buffer_schedule_post(token, channel_id, tweet_text, image_url, scheduled_time)
+            if ok:
+                print(f"✅ Запланировано на {scheduled_time.strftime('%H:%M')} UTC (Buffer id: {info})")
+                scheduled_posts.append(post["link"])
+                new_last_scheduled = scheduled_time
+            else:
+                print(f"❌ Ошибка планирования для {post_id}: {info}")
+                # Если ошибка, пробуем сдвинуть время на 2 минуты вперёд и повторить
+                print(f"🔄 Пробуем ещё раз со сдвигом +2 минуты...")
+                scheduled_time_retry = scheduled_time + timedelta(minutes=2)
+                ok2, info2 = buffer_schedule_post(token, channel_id, tweet_text, image_url, scheduled_time_retry)
+                if ok2:
+                    print(f"✅ Запланировано со сдвигом на {scheduled_time_retry.strftime('%H:%M')} UTC")
+                    scheduled_posts.append(post["link"])
+                    new_last_scheduled = scheduled_time_retry
+                else:
+                    print(f"❌ Повторная попытка тоже не удалась: {info2}")
+        except Exception as e:
+            print(f"❌ Исключение при планировании {post_id}: {e}")
+            continue
+
+        # Небольшая задержка между запросами к Buffer, чтобы не упереться в rate limit
+        time.sleep(1)
+
+    # Обновляем историю
+    if scheduled_posts:
+        for link in scheduled_posts:
+            processed.add(link)
+        history["processed"] = sorted(processed)[-500:]
+        history["last_scheduled_at"] = new_last_scheduled.strftime("%Y-%m-%dT%H:%M:%SZ")
+        print(f"\n📦 Запланировано {len(scheduled_posts)} постов в очередь Buffer")
+        print(f"🕐 Последний пост в очереди: {new_last_scheduled.strftime('%Y-%m-%d %H:%M:%S')} UTC")
     else:
-        print("😴 Новых новостей для твита нет.")
+        print("\n⚠️ Ни один пост не был запланирован")
 
-    history["processed"] = sorted(processed)[-500:]
     history["cache_counter"] = cache_counter + 1
     save_history(history)
 
+    # Чистим старые баннеры, оставляем последние 30
     if os.path.isdir("banners"):
         files = sorted(os.listdir("banners"), key=lambda n: int(re.sub(r'\D', '', n) or 0))
-        for name in files[:-20]:
+        for name in files[:-30]:
             try:
                 os.remove(os.path.join("banners", name))
             except Exception:
                 pass
 
     print("💾 История обновлена.")
+    print("=" * 60)
 
-def cmd_post():
-    if not os.path.exists(PENDING_FILE):
-        print("😴 Нет отложенного твита.")
-        return
-
-    token = os.environ.get("BUFFER_API_KEY", "")
-    if not token:
-        print("⚠️ BUFFER_API_KEY не задан в секретах — пост отложен.")
-        return
-
-    with open(PENDING_FILE, "r", encoding="utf-8") as f:
-        pending = json.load(f)
-
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
-    branch = os.environ.get("GITHUB_REF_NAME", "main")
-
-    if not repo:
-        print("❌ Нет GITHUB_REPOSITORY (запуск вне GitHub Actions).")
-        return
-
-    image_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{pending['image']}"
-
-    try:
-        channel_id = get_buffer_channel_id(token)
-        ok, info = buffer_create_post(token, channel_id, pending["text"], image_url)
-    except Exception as e:
-        ok, info = False, str(e)
-
-    already_posted = "already got this one scheduled" in str(info) or "same thing twice" in str(info)
-
-    if ok or already_posted:
-        if already_posted:
-            print(f"⚠️ Этот пост уже был опубликован ранее в Buffer. Помечаем как обработанный.")
-        else:
-            print(f"✅ Твит опубликован через Buffer, id: {info}")
-
-        history = load_history()
-        processed = set(history.get("processed", []))
-        processed.add(pending["link"])
-        history["processed"] = sorted(processed)[-500:]
-        save_history(history)
-
-        os.remove(PENDING_FILE)
-    else:
-        print(f"❌ Buffer не опубликовал: {info}. Повторим в следующем запуске.")
 
 if __name__ == "__main__":
     command = sys.argv[1] if len(sys.argv) > 1 else "generate"
-    if command == "post":
-        cmd_post()
-    else:
+    if command == "generate":
         cmd_generate()
+    else:
+        print(f"❓ Неизвестная команда: {command}")
