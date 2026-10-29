@@ -3,6 +3,7 @@ import re
 import sys
 import json
 import time
+import subprocess
 import requests
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
@@ -95,10 +96,7 @@ def get_all_posts_from_rss_bridge(cache_counter):
         if not image_url:
             content_div = item.find('div', class_='item-content')
             if content_div:
-                text_div = content_div.find('div', class_='tgme_widget_message_text')
                 for img in content_div.find_all('img'):
-                    if text_div and img.find_parent('div', class_='tgme_widget_message_text'):
-                        continue
                     if img.get('src'):
                         image_url = img.get('src')
                         break
@@ -134,18 +132,6 @@ def build_tweet_text(title_raw, link, hashtags=None):
             tags.append(t)
 
     suffix = "\n\nЧитать в телеграм 👉 "
-
-    while len(tags) > len(mandatory):
-        tags_line = "\n\n" + " ".join(tags)
-        if tweet_len(suffix) + 23 + tweet_len(tags_line) + 30 <= 280:
-            break
-        for i in range(len(tags) - 1, -1, -1):
-            if tags[i].lower() not in {m.lower() for m in mandatory}:
-                tags.pop(i)
-                break
-        else:
-            break
-
     tags_line = "\n\n" + " ".join(tags)
     available = 280 - tweet_len(suffix) - 23 - tweet_len(tags_line)
 
@@ -178,8 +164,12 @@ def select_fallback_image(title, text='', hashtags=None):
 
 
 def generate_card(image_url, title_text, fallback_context=None, output_path="banner.jpg"):
-    img = None
+    # Если баннер уже есть, не генерируем заново
+    if os.path.exists(output_path):
+        print(f"✅ Баннер уже существует: {output_path}")
+        return output_path
 
+    img = None
     if image_url:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
@@ -367,7 +357,7 @@ def load_history():
                 return json.load(f)
         except Exception as e:
             print(f"⚠️ Не удалось прочитать историю: {e}")
-    return {"processed": [], "cache_counter": 1, "last_scheduled_at": None}
+    return {"processed": [], "cache_counter": 1}
 
 
 def save_history(history):
@@ -378,7 +368,7 @@ def save_history(history):
 # ---------- Главная логика ----------
 def cmd_generate():
     print("=" * 60)
-    print("🚀 Запуск генерации очереди постов")
+    print("🚀 Запуск генерации и планирования очереди постов")
     print("=" * 60)
 
     token = os.environ.get("BUFFER_API_KEY", "")
@@ -392,26 +382,7 @@ def cmd_generate():
     history = load_history()
     processed = set(history.get("processed", []))
     cache_counter = history.get("cache_counter", 1)
-    last_scheduled_str = history.get("last_scheduled_at")
 
-    # Парсим время последнего запланированного поста
-    now = datetime.now(timezone.utc)
-    if last_scheduled_str:
-        try:
-            last_scheduled = datetime.fromisoformat(last_scheduled_str.replace("Z", "+00:00"))
-        except Exception:
-            last_scheduled = now
-    else:
-        last_scheduled = now
-
-    # Начинаем планирование от max(сейчас, last_scheduled + 2 минуты)
-    # Это защита: если прошлый запуск запланировал посты на будущее, не пересекаемся с ними
-    start_slot = max(now, last_scheduled + timedelta(minutes=POST_INTERVAL_MINUTES))
-    print(f"🕐 Текущее время (UTC): {now.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"📅 Последний запланированный пост: {last_scheduled.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"▶️  Первый слот для новых постов: {start_slot.strftime('%Y-%m-%d %H:%M:%S')}")
-
-    # Получаем новости из RSS
     print("\n📡 Получаем новости из RSS-Bridge...")
     posts = get_all_posts_from_rss_bridge(cache_counter)
     if not posts:
@@ -432,7 +403,65 @@ def cmd_generate():
         save_history(history)
         return
 
-    # Получаем ID канала Buffer
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    branch = os.environ.get("GITHUB_REF_NAME", "main")
+    os.makedirs("banners", exist_ok=True)
+
+    # ==========================================================
+    # ЭТАП 1: Генерируем ВСЕ баннеры локально
+    # ==========================================================
+    print("\n🎨 ЭТАП 1: Генерация баннеров...")
+    posts_to_schedule = []
+    
+    for post in new_posts:
+        post_id = post["link"].rstrip("/").split("/")[-1]
+        img_name = f"banners/{post_id}.jpg"
+
+        print(f"Генерируем: {post['title_clean'][:50]}...")
+        generate_card(
+            post["image_url"],
+            post["title_clean"],
+            fallback_context={'title': post.get('title_raw', ''), 'hashtags': post.get('hashtags', [])},
+            output_path=img_name
+        )
+
+        posts_to_schedule.append({
+            "post": post,
+            "img_name": img_name
+        })
+
+    # ==========================================================
+    # ЭТАП 2: Сохраняем баннеры в репозиторий (Git Push)
+    # Это КРИТИЧЕСКИ важно, иначе Buffer не сможет прочитать raw.githubusercontent.com
+    # ==========================================================
+    print("\n🔄 ЭТАП 2: Сохранение баннеров в репозиторий...")
+    try:
+        subprocess.run(["git", "config", "--local", "user.email", "action@github.com"], check=True)
+        subprocess.run(["git", "config", "--local", "user.name", "GitHub Action"], check=True)
+        subprocess.run(["git", "add", "banners/"], check=True)
+        
+        # Коммитим только если есть изменения
+        commit_result = subprocess.run(["git", "commit", "-m", "Add new banners [skip ci]"], capture_output=True, text=True)
+        if "nothing to commit" not in commit_result.stdout:
+            print("✅ Баннеры закоммичены.")
+            # Подтягиваем изменения, чтобы избежать конфликтов с другими workflow
+            subprocess.run(["git", "pull", "--rebase", "--autostash", "origin", "main"], capture_output=True)
+            subprocess.run(["git", "push"], check=True)
+            print("✅ Баннеры успешно загружены на GitHub!")
+        else:
+            print("ℹ️ Новые баннеры не созданы (возможно, уже были в репо).")
+
+        # Ждём 10 секунд, как вы просили, для гарантированного обновления CDN GitHub
+        print("⏳ Ожидание 10 секунд для распространения файлов на GitHub CDN...")
+        time.sleep(10)
+        
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️ Ошибка при git push: {e}. Продолжаем попытку отправки в Buffer...")
+
+    # ==========================================================
+    # ЭТАП 3: Отправляем посты в Buffer с расписанием
+    # ==========================================================
+    print("\n📤 ЭТАП 3: Планирование постов в Buffer...")
     try:
         channel_id = get_buffer_channel_id(token)
         print(f"📡 X-канал Buffer: {channel_id}")
@@ -440,79 +469,52 @@ def cmd_generate():
         print(f"❌ Ошибка получения канала: {e}")
         return
 
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
-    branch = os.environ.get("GITHUB_REF_NAME", "main")
-
-    os.makedirs("banners", exist_ok=True)
-
-    # Планируем каждый пост с интервалом 2 минуты
+    now = datetime.now(timezone.utc)
     scheduled_posts = []
-    new_last_scheduled = last_scheduled
 
-    for i, post in enumerate(new_posts):
+    for i, item in enumerate(posts_to_schedule):
+        post = item["post"]
+        img_name = item["img_name"]
         post_id = post["link"].rstrip("/").split("/")[-1]
-        img_name = f"banners/{post_id}.jpg"
-
-        # Генерируем баннер
-        print(f"\n🎨 Генерируем баннер для {post_id}: {post['title_clean'][:60]}...")
-        generate_card(
-            post["image_url"],
-            post["title_clean"],
-            fallback_context={
-                'title': post.get('title_raw', ''),
-                'text': '',
-                'hashtags': post.get('hashtags', [])
-            },
-            output_path=img_name
-        )
-
-        # Формируем текст твита
+        
         tweet_text = build_tweet_text(post["title_raw"], post["link"], post.get("hashtags", []))
+        # Теперь эта ссылка гарантированно работает, так как мы сделали git push выше
         image_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{img_name}"
+        
+        scheduled_time = now + timedelta(minutes=POST_INTERVAL_MINUTES * i)
 
-        # Вычисляем время публикации
-        scheduled_time = start_slot + timedelta(minutes=POST_INTERVAL_MINUTES * i)
-
-        # Отправляем в Buffer
         try:
             ok, info = buffer_schedule_post(token, channel_id, tweet_text, image_url, scheduled_time)
             if ok:
-                print(f"✅ Запланировано на {scheduled_time.strftime('%H:%M')} UTC (Buffer id: {info})")
+                print(f"✅ {post_id} запланирован на {scheduled_time.strftime('%H:%M')} UTC (id: {info})")
                 scheduled_posts.append(post["link"])
-                new_last_scheduled = scheduled_time
             else:
                 print(f"❌ Ошибка планирования для {post_id}: {info}")
-                # Если ошибка "лимит достигнут" — останавливаем цикл, чтобы не тратить запросы впустую
                 if "limit reached" in str(info).lower():
                     print("⏸️ Лимит Buffer достигнут — прерываем планирование, остальные добавим в следующий запуск")
                     break
-                # Иная ошибка — пробуем сдвинуть время на 2 минуты вперёд и повторить
                 print(f"🔄 Пробуем ещё раз со сдвигом +2 минуты...")
                 scheduled_time_retry = scheduled_time + timedelta(minutes=2)
                 ok2, info2 = buffer_schedule_post(token, channel_id, tweet_text, image_url, scheduled_time_retry)
                 if ok2:
-                    print(f"✅ Запланировано со сдвигом на {scheduled_time_retry.strftime('%H:%M')} UTC")
+                    print(f"✅ {post_id} запланирован со сдвигом на {scheduled_time_retry.strftime('%H:%M')} UTC")
                     scheduled_posts.append(post["link"])
-                    new_last_scheduled = scheduled_time_retry
                 else:
                     print(f"❌ Повторная попытка тоже не удалась: {info2}")
         except Exception as e:
             print(f"❌ Исключение при планировании {post_id}: {e}")
             continue
 
-        # Небольшая задержка между запросами к Buffer, чтобы не упереться в rate limit
-        time.sleep(1)
+        time.sleep(1) # Защита от rate limit
 
-    # Обновляем историю
+    # Обновляем историю только для успешно запланированных
     if scheduled_posts:
         for link in scheduled_posts:
             processed.add(link)
-        history["processed"] = sorted(processed)[-500:]
-        history["last_scheduled_at"] = new_last_scheduled.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        print(f"\n📦 Запланировано {len(scheduled_posts)} постов в очередь Buffer")
-        print(f"🕐 Последний пост в очереди: {new_last_scheduled.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        history["processed"] = sorted(list(processed))[-500:]
+        print(f"\n📦 Успешно запланировано {len(scheduled_posts)} постов в очередь Buffer")
     else:
-        print("\n⚠️ Ни один пост не был запланирован")
+        print("\n⚠️ Ни один пост не был успешно запланирован")
 
     history["cache_counter"] = cache_counter + 1
     save_history(history)
