@@ -3,6 +3,11 @@ name: Threads News (Buffer)
 on:
   workflow_dispatch:
 
+# 👇 Блокировка одновременных запусков всех workflow в этом репозитории
+concurrency:
+  group: el-pais-crossposter
+  cancel-in-progress: false
+
 jobs:
   post-threads:
     runs-on: ubuntu-latest
@@ -12,6 +17,8 @@ jobs:
     steps:
       - name: Скачиваем репозиторий (с папкой banners)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 👈 нужно для корректной работы git pull --rebase
 
       - name: Устанавливаем Python
         uses: actions/setup-python@v5
@@ -30,6 +37,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
           git add threads_posted_history.json
           if ! git diff --cached --quiet; then
             git commit -m "Update Threads history [skip ci]"
