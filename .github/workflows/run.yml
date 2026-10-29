@@ -1,9 +1,8 @@
-name: Generate News Banner
+name: Generate News Queue
 
 on:
   workflow_dispatch:
 
-# 👇 Блокировка одновременных запусков всех workflow в этом репозитории
 concurrency:
   group: el-pais-crossposter
   cancel-in-progress: false
@@ -14,13 +13,13 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10  # Вся задача максимум 10 минут
+    timeout-minutes: 20  # Увеличен, т.к. теперь может генерить много баннеров
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # 👈 нужно для корректной работы git pull --rebase
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -28,51 +27,32 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install system dependencies (with timeout)
+      - name: Install system dependencies
         run: |
-          timeout 120 sudo apt-get update || echo "⚠️ apt-get update таймаут, продолжаем"
-          timeout 120 sudo apt-get install -y libcairo2-dev pkg-config libffi-dev || echo "⚠️ apt-get install таймаут, продолжаем"
+          timeout 120 sudo apt-get update || echo "⚠️ apt-get update таймаут"
+          timeout 120 sudo apt-get install -y libcairo2-dev pkg-config libffi-dev || echo "⚠️ apt-get install таймаут"
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run script
+      - name: Run queue generator
         run: python main.py generate
-        env:
-          PYTHONUNBUFFERED: '1'
-
-      - name: Commit and Push banners
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git fetch origin main
-          git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "Update banner & queue [skip ci]"
-            git pull --rebase --autostash origin main || true
-            git push
-          else
-            echo "Блокировка коммита: изменений нет."
-          fi
-
-      - name: Post to Buffer (X/Twitter)
-        run: python main.py post
         env:
           PYTHONUNBUFFERED: '1'
           BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
 
-      - name: Commit history update
+      - name: Commit and Push changes
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git fetch origin main
           git add -A
           if ! git diff --cached --quiet; then
-            git commit -m "Update post history [skip ci]"
+            git commit -m "Update queue & banners [skip ci]"
             git pull --rebase --autostash origin main || true
             git push
           else
-            echo "Блокировка коммита: изменений нет."
+            echo "Нет изменений для коммита."
           fi
