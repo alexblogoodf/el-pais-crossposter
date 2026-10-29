@@ -331,21 +331,20 @@ def get_buffer_channel_id(token):
 
 
 def buffer_schedule_post(token, channel_id, text, image_url, scheduled_at):
-    """Планирует пост на конкретное время через shareAt"""
+    """Планирует пост на конкретное время через customScheduled + dueAt (по документации Buffer)"""
     text_lit = json.dumps(text, ensure_ascii=False)
     ch_lit = json.dumps(channel_id)
     url_lit = json.dumps(image_url)
-    # ISO 8601 формат для Buffer
-    scheduled_iso = scheduled_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-    scheduled_lit = json.dumps(scheduled_iso)
+    # 👇 ISO 8601 с миллисекундами, как в официальной документации Buffer
+    due_lit = json.dumps(scheduled_at.strftime("%Y-%m-%dT%H:%M:%S.000Z"))
 
     query = f'''mutation {{
   createPost(input: {{
     text: {text_lit},
     channelId: {ch_lit},
     schedulingType: automatic,
-    mode: custom,
-    scheduledAt: {scheduled_lit},
+    mode: customScheduled,
+    dueAt: {due_lit},
     assets: [{{ image: {{ url: {url_lit} }} }}]
   }}) {{
     ... on PostActionSuccess {{ post {{ id text dueAt }} }}
@@ -483,7 +482,11 @@ def cmd_generate():
                 new_last_scheduled = scheduled_time
             else:
                 print(f"❌ Ошибка планирования для {post_id}: {info}")
-                # Если ошибка, пробуем сдвинуть время на 2 минуты вперёд и повторить
+                # Если ошибка "лимит достигнут" — останавливаем цикл, чтобы не тратить запросы впустую
+                if "limit reached" in str(info).lower():
+                    print("⏸️ Лимит Buffer достигнут — прерываем планирование, остальные добавим в следующий запуск")
+                    break
+                # Иная ошибка — пробуем сдвинуть время на 2 минуты вперёд и повторить
                 print(f"🔄 Пробуем ещё раз со сдвигом +2 минуты...")
                 scheduled_time_retry = scheduled_time + timedelta(minutes=2)
                 ok2, info2 = buffer_schedule_post(token, channel_id, tweet_text, image_url, scheduled_time_retry)
@@ -505,7 +508,7 @@ def cmd_generate():
         for link in scheduled_posts:
             processed.add(link)
         history["processed"] = sorted(processed)[-500:]
-        history["last_scheduled_at"] = new_last_scheduled.strftime("%Y-%m-%dT%H:%M:%SZ")
+        history["last_scheduled_at"] = new_last_scheduled.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         print(f"\n📦 Запланировано {len(scheduled_posts)} постов в очередь Buffer")
         print(f"🕐 Последний пост в очереди: {new_last_scheduled.strftime('%Y-%m-%d %H:%M:%S')} UTC")
     else:
@@ -514,7 +517,7 @@ def cmd_generate():
     history["cache_counter"] = cache_counter + 1
     save_history(history)
 
-    # Чистим старые баннеры, оставляем последние 30
+    # Чистим старые баннеры, оставляем последние 70
     if os.path.isdir("banners"):
         files = sorted(os.listdir("banners"), key=lambda n: int(re.sub(r'\D', '', n) or 0))
         for name in files[:-70]:
