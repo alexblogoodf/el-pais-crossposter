@@ -3,6 +3,11 @@ name: Generate News Banner
 on:
   workflow_dispatch:
 
+# 👇 Блокировка одновременных запусков всех workflow в этом репозитории
+concurrency:
+  group: el-pais-crossposter
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -14,6 +19,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 👈 нужно для корректной работы git pull --rebase
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -40,9 +47,15 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
+          git fetch origin main
           git add -A
-          git commit -m "Update banner & queue [skip ci]" || echo "No changes to commit"
-          git push
+          if ! git diff --cached --quiet; then
+            git commit -m "Update banner & queue [skip ci]"
+            git pull --rebase --autostash origin main || true
+            git push
+          else
+            echo "Блокировка коммита: изменений нет."
+          fi
 
       - name: Post to Buffer (X/Twitter)
         run: python main.py post
@@ -54,6 +67,12 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
+          git fetch origin main
           git add -A
-          git commit -m "Update post history [skip ci]" || echo "No changes to commit"
-          git push
+          if ! git diff --cached --quiet; then
+            git commit -m "Update post history [skip ci]"
+            git pull --rebase --autostash origin main || true
+            git push
+          else
+            echo "Блокировка коммита: изменений нет."
+          fi
