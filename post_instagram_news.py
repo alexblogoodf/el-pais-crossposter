@@ -220,7 +220,7 @@ def buffer_schedule_instagram_post(token, channel_id, text, image_url, scheduled
     text: {text_lit},
     channelId: {ch_lit},
     schedulingType: automatic,
-    mode: shareAt,
+    mode: custom,
     scheduledAt: {scheduled_lit},
     assets: [{{ image: {{ url: {url_lit} }} }}],
     metadata: {{
