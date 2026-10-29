@@ -517,7 +517,7 @@ def cmd_generate():
     # Чистим старые баннеры, оставляем последние 30
     if os.path.isdir("banners"):
         files = sorted(os.listdir("banners"), key=lambda n: int(re.sub(r'\D', '', n) or 0))
-        for name in files[:-30]:
+        for name in files[:-70]:
             try:
                 os.remove(os.path.join("banners", name))
             except Exception:
