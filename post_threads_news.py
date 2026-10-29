@@ -2,6 +2,7 @@ import os
 import re
 import json
 import random
+import time
 import requests
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
@@ -194,22 +195,22 @@ def get_threads_channel_id(token):
 
 
 def buffer_schedule_threads_post(token, channel_id, main_text, reply_text, image_url, topic_tag, scheduled_at):
-    """Планирует тред (основной пост + reply) на конкретное время через shareAt"""
+    """Планирует тред (основной пост + reply) на конкретное время через customScheduled + dueAt"""
     text_lit  = json.dumps(main_text, ensure_ascii=False)
     reply_lit = json.dumps(reply_text, ensure_ascii=False)
     ch_lit    = json.dumps(channel_id)
     url_lit   = json.dumps(image_url)
     topic_lit = json.dumps(topic_tag, ensure_ascii=False)
-    scheduled_iso = scheduled_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-    scheduled_lit = json.dumps(scheduled_iso)
+    # 👇 Формат ISO 8601 с миллисекундами, как в официальной документации Buffer
+    due_lit = json.dumps(scheduled_at.strftime("%Y-%m-%dT%H:%M:%S.000Z"))
 
     query = f'''mutation {{
   createPost(input: {{
     text: {text_lit},
     channelId: {ch_lit},
     schedulingType: automatic,
-    mode: custom,
-    scheduledAt: {scheduled_lit},
+    mode: customScheduled,
+    dueAt: {due_lit},
     metadata: {{
       threads: {{
         topic: {topic_lit},
@@ -349,12 +350,15 @@ def main():
                 new_last_scheduled = current_slot
             else:
                 print(f"❌ Ошибка планирования: {info}")
+                # Если ошибка "лимит достигнут" — останавливаем цикл
+                if "limit reached" in str(info).lower():
+                    print("⏸️ Лимит Buffer достигнут — прерываем планирование, остальные добавим в следующий запуск")
+                    break
         except Exception as e:
             print(f"❌ Исключение: {e}")
             continue
 
         # Небольшая задержка между запросами к Buffer
-        import time
         time.sleep(1)
 
     # Обновляем историю
@@ -362,7 +366,8 @@ def main():
         for pid in scheduled_posts:
             posted_ids.add(pid)
         history["posted"] = sorted(list(posted_ids))[-500:]
-        history["last_scheduled_at"] = new_last_scheduled.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # 👇 Сохраняем с миллисекундами для совместимости
+        history["last_scheduled_at"] = new_last_scheduled.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         print(f"\n📦 Запланировано {len(scheduled_posts)} Threads-постов в очередь Buffer")
         print(f"🕐 Последний пост в очереди: {new_last_scheduled.strftime('%Y-%m-%d %H:%M:%S')} UTC")
     else:
